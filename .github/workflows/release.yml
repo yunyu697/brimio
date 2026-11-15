@@ -1,0 +1,82 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build-and-release:
+    runs-on: macos-14
+    timeout-minutes: 40
+    env:
+      TAG_NAME: ${{ github.ref_name }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # 提交数要参与 CFBundleVersion，必须拿全历史。
+          fetch-depth: 0
+
+      - name: 版本规则（非法 tag 直接拒发）
+        run: |
+          bash Scripts/version-check.sh --self-test
+          bash Scripts/version-check.sh "$TAG_NAME"
+
+      - name: 命名单一来源
+        run: bash Scripts/naming.sh --check
+
+      - name: 敏感内容扫描
+        run: bash Scripts/scan-content.sh
+
+      - name: 构建 + 打包（tag 注入，注入值与 ref 不一致即 FAIL）
+        run: |
+          TAG="$TAG_NAME" \
+          VERIFY_TAG="$TAG_NAME" \
+          CONFIG=release \
+          PACKAGE=1 \
+          OUT="$PWD/build/Brimio.app" \
+          DIST="$PWD/dist" \
+          bash Scripts/make-app.sh
+
+      - name: 注入值回读（必须等于 tag）
+        run: |
+          PLIST="build/Brimio.app/Contents/Info.plist"
+          SHORT="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$PLIST")"
+          BUILD="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleVersion' "$PLIST")"
+          EXPECTED="${TAG_NAME#v}"; EXPECTED="${EXPECTED%%-*}"
+          echo "tag=$TAG_NAME short=$SHORT build=$BUILD expected=$EXPECTED"
+          [ "$SHORT" = "$EXPECTED" ] || { echo "FAIL: CFBundleShortVersionString != tag"; exit 1; }
+
+      - name: 打印 sha256
+        run: |
+          ASSET="$(bash Scripts/naming.sh --asset "$TAG_NAME")"
+          echo "asset=$ASSET" >> "$GITHUB_ENV"
+          shasum -a 256 "dist/$ASSET" | tee "dist/$ASSET.sha256"
+          {
+            echo "### Release $TAG_NAME"
+            echo '```'
+            cat "dist/$ASSET.sha256"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: 创建 GitHub Release 并附产物
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          FLAGS=()
+          case "$TAG_NAME" in
+            *-alpha*|*-RC*) FLAGS+=(--prerelease) ;;
+          esac
+          gh release create "$TAG_NAME" \
+            "dist/$ASSET" \
+            "dist/$ASSET.sha256" \
+            --title "$TAG_NAME" \
+            --generate-notes \
+            "${FLAGS[@]}"

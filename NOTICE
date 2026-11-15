@@ -1,0 +1,17 @@
+NOTICE
+
+本仓库以 GNU General Public License v3.0（GPL-3.0）分发，全文见 LICENSE。
+
+第三方来源
+----------
+
+1. NotchShape 的路径几何
+
+   - 来源项目：TheBoredTeam/boring.notch
+   - 仓库链接：https://github.com/TheBoredTeam/boring.notch
+   - 上游协议：GNU General Public License v3.0（GPL-3.0）
+   - 上游 LICENSE 文件 sha256：3972dc9744f6499f0f9b2dbf76696f2ae7ad8af9b23dde66d6af86c9dfb36986
+   - 涉及范围：本仓库 `Sources/Brimio/NotchShape.swift` 中刘海形状的路径几何
+     （顶部圆角、底部外扩曲线与 `Shape` 的 path 构造）改写自该项目。
+
+以上仅记录来源与协议事实。

@@ -1,0 +1,24 @@
+# SwiftPM / 构建产物
+.build/
+.notch-build/
+build/
+dist/
+*.xcodeproj
+
+# 归档与 bundle（可由脚本重建）
+*.zip
+*.dmg
+*.app/
+
+# 渲染与截图产物（可由 --render 随时重新生成）
+Snapshots/*.png
+*.png
+
+# macOS
+.DS_Store
+._*
+
+# 编辑器
+.vscode/
+.idea/
+*.swp

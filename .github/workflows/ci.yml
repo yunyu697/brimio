@@ -1,0 +1,51 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+# 只读权限：PR 与主干推送都不需要写仓库。
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  verify:
+    runs-on: macos-14
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 工具链
+        run: |
+          xcodebuild -version
+          swift --version
+
+      - name: 命名单一来源（Config/naming.env ↔ 生成文件）
+        run: bash Scripts/naming.sh --check
+
+      - name: 版本号规则（合法/非法用例）
+        run: bash Scripts/version-check.sh --self-test
+
+      - name: 敏感内容扫描（命中即失败）
+        run: bash Scripts/scan-content.sh
+
+      - name: 构建
+        run: swift build -c release
+
+      - name: selftest（含设计 lint）
+        # 无屏 runner 上若失败，日志里会留下真实原因；不要在这里加 `|| true`。
+        run: .build/release/Brimio --selftest
+
+      - name: 打包冒烟（不发布）
+        run: |
+          TAG="v0.0.0" \
+          CONFIG=release \
+          OUT="$PWD/build/Brimio.app" \
+          bash Scripts/make-app.sh
+          /usr/libexec/PlistBuddy -c "Print :CFBundleShortVersionString" build/Brimio.app/Contents/Info.plist
