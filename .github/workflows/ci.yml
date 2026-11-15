@@ -38,9 +38,15 @@ jobs:
       - name: 构建
         run: swift build -c release
 
-      - name: selftest（含设计 lint）
-        # 无屏 runner 上若失败，日志里会留下真实原因；不要在这里加 `|| true`。
-        run: .build/release/Brimio --selftest
+      - name: selftest（无屏：注入固定几何，并证明走的是注入路径）
+        # runner 没有物理屏，几何用固定值注入；日志里必须出现 source=injected 与不覆盖清单。
+        # 不在这里加 `|| true`：断言失败就是失败。
+        run: |
+          .build/release/Brimio --selftest \
+            --headless-geometry=1512x982,inset=32,menubar=32 | tee selftest.log
+          grep -q "geometry source is injected" selftest.log
+          grep -q "本环境不覆盖" selftest.log
+          echo "headless selftest verified: injected geometry + uncovered list printed"
 
       - name: 打包冒烟（不发布）
         run: |

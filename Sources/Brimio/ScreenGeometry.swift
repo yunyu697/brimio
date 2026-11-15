@@ -45,10 +45,51 @@ enum ScreenGeometry {
     /// 32：与物理刘海高度一致。
     static let notchHeight: CGFloat = 32
 
+    // MARK: - 几何输入（可注入）
+
+    /// 把「屏幕」抽象成一组数值。生产路径从 `NSScreen` 取，selftest 可以注入固定值，
+    /// 这样无屏 runner 上也能真跑几何断言，而不是静默跳过。
+    struct Metrics: Equatable {
+        var frame: CGRect
+        var visibleFrameMaxY: CGFloat
+        var safeAreaTop: CGFloat
+        var auxLeftWidth: CGFloat?
+        var auxRightWidth: CGFloat?
+        var name: String
+
+        static func from(_ screen: NSScreen) -> Metrics {
+            Metrics(
+                frame: screen.frame,
+                visibleFrameMaxY: screen.visibleFrame.maxY,
+                safeAreaTop: screen.safeAreaInsets.top,
+                auxLeftWidth: screen.auxiliaryTopLeftArea?.width,
+                auxRightWidth: screen.auxiliaryTopRightArea?.width,
+                name: screen.localizedName
+            )
+        }
+    }
+
+    /// 只有显式传入 `--headless-geometry=...`（或环境变量）时才非空。
+    /// 默认 `nil`，生产路径不会走到注入分支。
+    static var injected: Metrics?
+
+    /// 当前几何 + 来源标签。`source=injected` 表示确实走了注入路径。
+    static func current() -> (metrics: Metrics, source: String)? {
+        if let injected { return (injected, "injected") }
+        if let screen = NSScreen.main ?? NSScreen.screens.first {
+            return (Metrics.from(screen), "NSScreen")
+        }
+        return nil
+    }
+
     // MARK: - 刘海判定
 
     static func hasNotch(_ screen: NSScreen) -> Bool {
-        screen.safeAreaInsets.top > 0
+        hasNotch(Metrics.from(screen))
+    }
+
+    static func hasNotch(_ metrics: Metrics) -> Bool {
+        metrics.safeAreaTop > 0
     }
 
     /// 刘海高度取值方式。
@@ -65,20 +106,28 @@ enum ScreenGeometry {
         for screen: NSScreen,
         heightMode: NotchHeightMode? = nil
     ) -> CGSize {
+        closedSize(for: Metrics.from(screen), heightMode: heightMode)
+    }
+
+    /// 与上面同一个算法，输入换成可注入的 `Metrics`。
+    static func closedSize(
+        for metrics: Metrics,
+        heightMode: NotchHeightMode? = nil
+    ) -> CGSize {
         var width = fallbackNotchWidth
-        if let left = screen.auxiliaryTopLeftArea, let right = screen.auxiliaryTopRightArea {
+        if let left = metrics.auxLeftWidth, let right = metrics.auxRightWidth {
             // +4 是四处各 1pt 的抗锯齿补偿：刘海边缘落在半像素上，不补会在与菜单栏之间露出 1px 亮缝。
-            width = screen.frame.width - left.width - right.width + 4
+            width = metrics.frame.width - left - right + 4
         }
 
         // 默认：有刘海屏取真实刘海高度，无刘海屏取菜单栏高度。
-        let mode = heightMode ?? (hasNotch(screen) ? .matchRealNotchSize : .matchMenuBar)
+        let mode = heightMode ?? (hasNotch(metrics) ? .matchRealNotchSize : .matchMenuBar)
         let height: CGFloat
         switch mode {
         case .matchRealNotchSize:
-            height = hasNotch(screen) ? screen.safeAreaInsets.top : nonNotchHeight
+            height = hasNotch(metrics) ? metrics.safeAreaTop : nonNotchHeight
         case .matchMenuBar:
-            height = menuBarHeight(for: screen)
+            height = menuBarHeight(for: metrics)
         case .custom(let value):
             height = value
         }
@@ -89,17 +138,24 @@ enum ScreenGeometry {
     /// 菜单栏高度：`frame.maxY - visibleFrame.maxY`。
     /// 这是 AppKit 里唯一可靠的来源；24pt 下限防止隐藏菜单栏等状态下算出 0。
     static func menuBarHeight(for screen: NSScreen) -> CGFloat {
-        max(screen.frame.maxY - screen.visibleFrame.maxY, 24)
+        menuBarHeight(for: Metrics.from(screen))
+    }
+
+    static func menuBarHeight(for metrics: Metrics) -> CGFloat {
+        max(metrics.frame.maxY - metrics.visibleFrameMaxY, 24)
     }
 
     // MARK: - 矩形计算
 
     /// 屏幕顶部居中的矩形（AppKit 坐标：原点左下，y 向上）。
     static func rectAtTopCenter(size: CGSize, on screen: NSScreen) -> NSRect {
-        let frame = screen.frame
-        return NSRect(
-            x: frame.origin.x + (frame.width - size.width) / 2,
-            y: frame.maxY - size.height,
+        rectAtTopCenter(size: size, on: Metrics.from(screen))
+    }
+
+    static func rectAtTopCenter(size: CGSize, on metrics: Metrics) -> NSRect {
+        NSRect(
+            x: metrics.frame.origin.x + (metrics.frame.width - size.width) / 2,
+            y: metrics.frame.maxY - size.height,
             width: size.width,
             height: size.height
         )
@@ -107,17 +163,29 @@ enum ScreenGeometry {
 
     /// 窗口矩形：固定 windowSize，顶边贴屏幕顶边、水平居中。
     static func windowFrame(for screen: NSScreen) -> NSRect {
-        rectAtTopCenter(size: windowSize, on: screen)
+        windowFrame(for: Metrics.from(screen))
+    }
+
+    static func windowFrame(for metrics: Metrics) -> NSRect {
+        rectAtTopCenter(size: windowSize, on: metrics)
     }
 
     /// 闭合态的命中矩形（也就是视觉上的刘海）。
     static func closedRect(for screen: NSScreen) -> NSRect {
-        rectAtTopCenter(size: closedSize(for: screen), on: screen)
+        closedRect(for: Metrics.from(screen))
+    }
+
+    static func closedRect(for metrics: Metrics) -> NSRect {
+        rectAtTopCenter(size: closedSize(for: metrics), on: metrics)
     }
 
     /// 展开态形状矩形（按传入页面尺寸；命中与阴影都用它，而不是窗口矩形）。
     static func openRect(for screen: NSScreen, size: CGSize) -> NSRect {
-        rectAtTopCenter(size: size, on: screen)
+        openRect(for: Metrics.from(screen), size: size)
+    }
+
+    static func openRect(for metrics: Metrics, size: CGSize) -> NSRect {
+        rectAtTopCenter(size: size, on: metrics)
     }
 
     // MARK: - 屏幕标识

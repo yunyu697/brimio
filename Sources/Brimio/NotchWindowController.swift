@@ -10,7 +10,8 @@ import SwiftUI
 /// - 开合由全局 + 本地 mouseMoved 监听驱动，带进入/离开延时。
 @MainActor
 final class NotchWindowController {
-    private let screen: NSScreen
+    /// 几何输入。生产路径来自 `NSScreen`，selftest 可以注入固定值（无屏 runner）。
+    private let metrics: ScreenGeometry.Metrics
     private let viewModel: NotchViewModel
     private let panel: NotchPanel
     /// 媒体服务：事件驱动读 AppleScript，结果推回 viewModel。
@@ -41,12 +42,16 @@ final class NotchWindowController {
     /// 自测时关掉真实指针监听，避免和程序化调用互相覆盖。
     var pointerTrackingEnabled = true
 
-    init(screen: NSScreen) {
-        self.screen = screen
+    convenience init(screen: NSScreen) {
+        self.init(metrics: ScreenGeometry.Metrics.from(screen))
+    }
+
+    init(metrics: ScreenGeometry.Metrics) {
+        self.metrics = metrics
 
         let vm = NotchViewModel(
-            closedSize: ScreenGeometry.closedSize(for: screen),
-            menuBarHeight: ScreenGeometry.menuBarHeight(for: screen)
+            closedSize: ScreenGeometry.closedSize(for: metrics),
+            menuBarHeight: ScreenGeometry.menuBarHeight(for: metrics)
         )
         self.viewModel = vm
 
@@ -83,7 +88,7 @@ final class NotchWindowController {
             onDropFiles: { urls in relay.onDrop?(urls) }
         )
         let hostingView = NotchHostingView(rootView: rootView)
-        let frame = ScreenGeometry.windowFrame(for: screen)
+        let frame = ScreenGeometry.windowFrame(for: metrics)
         hostingView.frame = NSRect(origin: .zero, size: frame.size)
         hostingView.autoresizingMask = [.width, .height]
 
@@ -117,15 +122,15 @@ final class NotchWindowController {
             NSStringFromRect(hostingView.frame),
             hostingView.safeAreaInsets.top,
             NSStringFromSize(vm.closedSize),
-            ScreenGeometry.menuBarHeight(for: screen),
+            ScreenGeometry.menuBarHeight(for: metrics),
             vm.chinHeight,
-            screen.localizedName
+            metrics.name
         )
     }
 
     var windowForTesting: NotchPanel { panel }
     var viewModelForTesting: NotchViewModel { viewModel }
-    var screenForTesting: NSScreen { screen }
+    var metricsForTesting: ScreenGeometry.Metrics { metrics }
 
     /// 功耗探针用：停掉控制器自带的媒体服务，
     /// 否则它那条「播放中 2s 复核」会污染采样窗口。
@@ -139,7 +144,7 @@ final class NotchWindowController {
     /// 而不是固定的窗口矩形——窗口是 312×200 的画布，比形状大得多，
     /// 用窗口矩形会让面板外一圈空白也吃鼠标事件。
     private var interactiveRect: NSRect {
-        let base = ScreenGeometry.rectAtTopCenter(size: viewModel.notchSize, on: screen)
+        let base = ScreenGeometry.rectAtTopCenter(size: viewModel.notchSize, on: metrics)
         // 闭合态缩略图只向右加宽：形状中心随之右移，命中矩形也得跟着移，
         // 否则缩略图那一块看得见但点不到。
         let shifted = base.offsetBy(dx: viewModel.closedBadgeOffset, dy: 0)

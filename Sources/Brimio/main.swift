@@ -2,11 +2,112 @@ import AppKit
 import CoreGraphics
 import SwiftUI
 
+/// 无屏几何注入。
+///
+/// `--headless-geometry=1512x982,inset=32,menubar=32,auxl=666.5,auxr=666.5`
+/// 或环境变量 `BRIMIO_HEADLESS_GEOMETRY`（CI 用前者，便于在日志里看到实参）。
+/// 只有显式给出时 `ScreenGeometry.injected` 才非空；生产路径永远从 `NSScreen` 取。
+enum HeadlessGeometry {
+    static let flagPrefix = "--headless-geometry="
+    static let envKey = "BRIMIO_HEADLESS_GEOMETRY"
+
+    static func rawSpec(_ args: [String]) -> String? {
+        let fromArgs = args.compactMap { arg -> String? in
+            guard arg.hasPrefix(flagPrefix) else { return nil }
+            return String(arg.dropFirst(flagPrefix.count))
+        }.last
+        if let fromArgs, !fromArgs.isEmpty { return fromArgs }
+        if let fromEnv = ProcessInfo.processInfo.environment[envKey], !fromEnv.isEmpty { return fromEnv }
+        return nil
+    }
+
+    static func metrics(from spec: String) -> ScreenGeometry.Metrics? {
+        var width: CGFloat = 1512
+        var height: CGFloat = 982
+        var inset: CGFloat = 32
+        var menuBar: CGFloat = 32
+        var auxLeft: CGFloat?
+        var auxRight: CGFloat?
+        var sawSize = false
+
+        for rawPart in spec.split(separator: ",") {
+            let part = rawPart.trimmingCharacters(in: .whitespaces)
+            if part.contains("x"), !part.contains("=") {
+                let wh = part.split(separator: "x")
+                guard wh.count == 2, let w = Double(wh[0]), let h = Double(wh[1]), w > 0, h > 0 else {
+                    return nil
+                }
+                width = CGFloat(w)
+                height = CGFloat(h)
+                sawSize = true
+            } else if let eq = part.firstIndex(of: "=") {
+                let key = String(part[..<eq])
+                guard let value = Double(part[part.index(after: eq)...]) else { return nil }
+                switch key {
+                case "inset": inset = CGFloat(value)
+                case "menubar": menuBar = CGFloat(value)
+                case "auxl": auxLeft = CGFloat(value)
+                case "auxr": auxRight = CGFloat(value)
+                default: return nil
+                }
+            } else {
+                return nil
+            }
+        }
+        guard sawSize else { return nil }
+
+        return ScreenGeometry.Metrics(
+            frame: CGRect(x: 0, y: 0, width: width, height: height),
+            visibleFrameMaxY: height - menuBar,
+            safeAreaTop: inset,
+            auxLeftWidth: auxLeft,
+            auxRightWidth: auxRight,
+            name: "injected \(Int(width))x\(Int(height))"
+        )
+    }
+}
+
+/// 本轮期望的几何来源。由启动参数决定，`--selftest` 里断言实际来源与它一致，
+/// 避免「加了 flag 但代码仍走 NSScreen」这种假绿。
+var expectedGeometrySource = "NSScreen"
+
+/// 无屏注入下**确实无法验证**的项。只在 source=injected 时打印，不做静默跳过：
+/// 这些断言在真实有屏机器上照常执行（同一个二进制、同一套断言）。
+let headlessUncovered: [String] = [
+    "NSScreen 的真实读数：safeAreaInsets.top / auxiliaryTopLeftArea / auxiliaryTopRightArea 用注入值代替，只验证算法不验证真机",
+    "真实窗口层级与跨屏跟随（屏参变化、热插拔、全屏 App 下的层序）",
+    "真实指针位置相关的采样：hover 进入/离开、拖放悬停、⌘ 拖出（--e2e / --animate-probe 不在本模式运行）",
+    "屏幕录制与视觉复核（--render / --shadow-probe / --shoulder-probe 需要真实屏）",
+]
+
 /// AppKit 生命周期入口（不使用 SwiftUI App，避免非 bundle 可执行文件的启动差异）。
 final class AppDelegate: NSObject, NSApplicationDelegate {
     private var controller: NotchWindowController?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
+        // 几何注入只影响 selftest；其余模式仍然要求真实屏幕。
+        if let spec = HeadlessGeometry.rawSpec(CommandLine.arguments) {
+            guard let metrics = HeadlessGeometry.metrics(from: spec) else {
+                print("[SELFTEST] FAIL 无法解析 --headless-geometry=\(spec)")
+                exit(1)
+            }
+            ScreenGeometry.injected = metrics
+            expectedGeometrySource = "injected"
+            print("[SELFTEST] geometry spec=\(spec)")
+        }
+
+        // selftest：几何可注入，因此不强制要求物理屏。
+        if CommandLine.arguments.contains("--selftest") {
+            guard let geometry = ScreenGeometry.current() else {
+                print("[SELFTEST] FAIL no screen and no injected geometry")
+                exit(1)
+            }
+            print("[SELFTEST] geometry source=\(geometry.source) name=\(geometry.metrics.name)")
+            controller = NotchWindowController(metrics: geometry.metrics)
+            runSelfTest()
+            return
+        }
+
         guard let screen = NSScreen.main ?? NSScreen.screens.first else {
             NSLog("[Brimio] no screen available")
             NSApp.terminate(nil)
@@ -95,8 +196,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
             let panel = controller.windowForTesting
             let vm = controller.viewModelForTesting
-            let screen = controller.screenForTesting
-            let expected = ScreenGeometry.windowFrame(for: screen)
+            // 几何一律走注入值；真实屏幕只在 source=NSScreen 时存在。
+            let metrics = controller.metricsForTesting
+            let geometrySource = ScreenGeometry.injected == nil ? "NSScreen" : "injected"
+            let screen: NSScreen? = geometrySource == "NSScreen" ? (NSScreen.main ?? NSScreen.screens.first) : nil
+            let expected = ScreenGeometry.windowFrame(for: metrics)
+
+            // 0. 几何来源：证明注入路径真的被走到（而不是加了 flag 仍读 NSScreen）。
+            check(
+                geometrySource == expectedGeometrySource,
+                "geometry source is \(expectedGeometrySource)",
+                "source=\(geometrySource) name=\(metrics.name) "
+                    + "frame=\(Int(metrics.frame.width))x\(Int(metrics.frame.height)) "
+                    + "inset=\(Int(metrics.safeAreaTop))"
+            )
 
             // 1. 窗口存在且在屏幕顶部
             check(panel.isVisible, "window is visible")
@@ -110,9 +223,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 "window wider than largest page (room for spring overshoot)",
                 "window=\(Int(ScreenGeometry.windowSize.width)) maxPage=\(Int(ScreenGeometry.maxOpenSize.width))"
             )
-            check(panel.frame.maxY == screen.frame.maxY, "window top aligned with screen top", "maxY=\(panel.frame.maxY)")
+            check(panel.frame.maxY == metrics.frame.maxY, "window top aligned with screen top", "maxY=\(panel.frame.maxY)")
             check(
-                abs(panel.frame.midX - screen.frame.midX) < 0.5,
+                abs(panel.frame.midX - metrics.frame.midX) < 0.5,
                 "window horizontally centered",
                 "midX=\(panel.frame.midX)"
             )
@@ -128,7 +241,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             // 2. WindowServer 视角：窗口确实在屏幕上
             //
             // 此前这条断言被放宽成「相等或等比缩放 0.85~1.01」，等于给 9.5% 的尺寸偏差
-            // 发了长期通行证。`--window-probe` 查清：`window.frame` 316×148 一直没变，
+            // 发了长期通行证。`--window-probe` 查清：`window.frame` 一直是固定尺寸，
             // 变的是**坐标空间**——本机 CGWindowList 的全局空间里，整块桌面被等比缩小并居中
             // （桌面 1324×862 @ (73,47)，而 display bounds 是 1470×956），
             // 0ms/100ms/500ms/1s/3s 五个时刻完全一致，且不带 hud/utility 样式的对照窗口数值相同，
@@ -138,53 +251,60 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             // a) 与「同 frame、无面板样式」的对照窗口在合成器里必须完全相等（0 容差）；
             // b) 换算到 CG 空间后与 frame 严格对齐（容差 2.5pt：实测残差 1.6pt，来自合成器
             //    对每条边各自取整，同一台机器上稳定）。
-            try? await Task.sleep(nanoseconds: 1_200_000_000)
-            let onScreen = onScreenWindowBounds(pid: getpid())
-            for info in onScreenWindowInfo(pid: getpid()) {
-                print(
-                    "[SELFTEST] window-info layer=\(info[kCGWindowLayer as String] ?? "-")"
-                        + " alpha=\(info[kCGWindowAlpha as String] ?? "-")"
-                        + " bounds=\(info[kCGWindowBounds as String] ?? "-")"
-                )
-            }
-            check(onScreen.count == 1, "window registered on screen", "count=\(onScreen.count)")
-            if let bounds = onScreen.first {
-                let control = referenceWindow(panel.frame)
-                let mapper = await cgSpaceMapper(for: screen)
-                try? await Task.sleep(nanoseconds: 180_000_000)
-                let controlBounds = cgWindowBounds(for: control)
-                control.orderOut(nil)
+            //
+            // 这一段依赖真实屏幕（坐标空间换算需要 NSScreen），注入模式下显式标为「本环境不覆盖」，
+            // 打印出来，而不是静默当作通过。
+            if let screen {
+                try? await Task.sleep(nanoseconds: 1_200_000_000)
+                let onScreen = onScreenWindowBounds(pid: getpid())
+                for info in onScreenWindowInfo(pid: getpid()) {
+                    print(
+                        "[SELFTEST] window-info layer=\(info[kCGWindowLayer as String] ?? "-")"
+                            + " alpha=\(info[kCGWindowAlpha as String] ?? "-")"
+                            + " bounds=\(info[kCGWindowBounds as String] ?? "-")"
+                    )
+                }
+                check(onScreen.count == 1, "window registered on screen", "count=\(onScreen.count)")
+                if let bounds = onScreen.first {
+                    let control = referenceWindow(panel.frame)
+                    let mapper = await cgSpaceMapper(for: screen)
+                    try? await Task.sleep(nanoseconds: 180_000_000)
+                    let controlBounds = cgWindowBounds(for: control)
+                    control.orderOut(nil)
 
-                if let controlBounds {
-                    check(
-                        bounds == controlBounds,
-                        "panel composites exactly like a plain window of the same frame",
-                        "panel=\(bounds) control=\(controlBounds)"
-                    )
+                    if let controlBounds {
+                        check(
+                            bounds == controlBounds,
+                            "panel composites exactly like a plain window of the same frame",
+                            "panel=\(bounds) control=\(controlBounds)"
+                        )
+                    }
+                    if let mapper {
+                        print("[SELFTEST] cg-space \(mapper.summary)")
+                        let mapped = mapper.map(panel.frame)
+                        let residual = max(
+                            abs(bounds.minX - mapped.minX), abs(bounds.minY - mapped.minY),
+                            abs(bounds.width - mapped.width), abs(bounds.height - mapped.height)
+                        )
+                        check(
+                            residual <= 2.5,
+                            "on-screen bounds equal window frame mapped into CG space",
+                            String(format: "bounds=%.1fx%.1f@(%.1f,%.1f) mapped=%.1fx%.1f@(%.1f,%.1f) residual=%.2fpt",
+                                   bounds.width, bounds.height, bounds.minX, bounds.minY,
+                                   mapped.width, mapped.height, mapped.minX, mapped.minY, residual)
+                        )
+                        let mappedScreen = mapper.map(screen.frame)
+                        check(
+                            abs(bounds.minY - mappedScreen.minY) <= 1
+                                && abs(bounds.midX - mappedScreen.midX) <= 2,
+                            "on-screen bounds touch screen top",
+                            String(format: "minY=%.1f top=%.1f midX=%.1f center=%.1f",
+                                   bounds.minY, mappedScreen.minY, bounds.midX, mappedScreen.midX)
+                        )
+                    }
                 }
-                if let mapper {
-                    print("[SELFTEST] cg-space \(mapper.summary)")
-                    let mapped = mapper.map(panel.frame)
-                    let residual = max(
-                        abs(bounds.minX - mapped.minX), abs(bounds.minY - mapped.minY),
-                        abs(bounds.width - mapped.width), abs(bounds.height - mapped.height)
-                    )
-                    check(
-                        residual <= 2.5,
-                        "on-screen bounds equal window frame mapped into CG space",
-                        String(format: "bounds=%.1fx%.1f@(%.1f,%.1f) mapped=%.1fx%.1f@(%.1f,%.1f) residual=%.2fpt",
-                               bounds.width, bounds.height, bounds.minX, bounds.minY,
-                               mapped.width, mapped.height, mapped.minX, mapped.minY, residual)
-                    )
-                    let mappedScreen = mapper.map(screen.frame)
-                    check(
-                        abs(bounds.minY - mappedScreen.minY) <= 1
-                            && abs(bounds.midX - mappedScreen.midX) <= 2,
-                        "on-screen bounds touch screen top",
-                        String(format: "minY=%.1f top=%.1f midX=%.1f center=%.1f",
-                               bounds.minY, mappedScreen.minY, bounds.midX, mappedScreen.midX)
-                    )
-                }
+            } else {
+                print("[SELFTEST] UNCOVERED  WindowServer 注册 / CG 坐标空间对齐（source=injected，无真实屏幕）")
             }
 
             // 3. 初始穿透
@@ -653,8 +773,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 "声明在设置里的=\(automationPlayers.sorted()) 代码里真会调用的=\(AppleScriptBackend.supportedBundleIDs.sorted())"
             )
 
+            // 无屏注入时，把「本环境不覆盖」的项显式打出来：不静默跳过、不假装通过。
+            if geometrySource == "injected" {
+                print("[SELFTEST] 本环境不覆盖（source=injected，共 \(headlessUncovered.count) 项）：")
+                for item in headlessUncovered {
+                    print("[SELFTEST] UNCOVERED  \(item)")
+                }
+            }
+
             if failures.isEmpty {
-                print("[SELFTEST] PASS all \(total) checks")
+                print("[SELFTEST] PASS all \(total) checks  source=\(geometrySource)")
                 exit(0)
             } else {
                 print("[SELFTEST] FAIL \(failures.count)/\(total) check(s): \(failures.joined(separator: ", "))")
@@ -1904,7 +2032,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         Task { @MainActor in
             let original = NSEvent.mouseLocation
-            let closedRect = ScreenGeometry.closedRect(for: controller.screenForTesting)
+            let closedRect = ScreenGeometry.closedRect(for: controller.metricsForTesting)
             let target = NSPoint(x: closedRect.midX, y: closedRect.midY)
             let away = NSPoint(x: target.x, y: max(target.y - 420, 120))
 
