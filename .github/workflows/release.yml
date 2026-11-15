@@ -14,7 +14,7 @@ concurrency:
 
 jobs:
   build-and-release:
-    runs-on: macos-14
+    runs-on: macos-latest
     timeout-minutes: 40
     env:
       TAG_NAME: ${{ github.ref_name }}
