@@ -190,7 +190,8 @@ if [[ "${PACKAGE:-0}" == "1" ]]; then
     rm -f "$DIST/$ASSET" "$DIST/$ASSET.sha256"
     # ditto 保留 bundle 的资源分叉与权限，是 macOS 上打 .app 压缩包的正确工具。
     ditto -c -k --sequesterRsrc --keepParent "$APP" "$DIST/$ASSET"
-    shasum -a 256 "$DIST/$ASSET" | tee "$DIST/$ASSET.sha256"
+    # 校验文件里只写裸文件名：带绝对路径的话，用户下载后 `shasum -c` 会指向构建机上的路径而失败。
+    ( cd "$DIST" && shasum -a 256 "$ASSET" | tee "$ASSET.sha256" )
     echo "[make-app] asset=$(basename "$DIST/$ASSET")"
 fi
 
