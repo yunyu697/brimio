@@ -1084,15 +1084,20 @@ shasum -a 256 /abs/build/Brimio.app/Contents/MacOS/Brimio /abs/scratch/out/Produ
 
 ## License
 
-本项目整体以 **GNU General Public License v3.0（GPL-3.0）** 分发，全文见仓库根目录的 [LICENSE](LICENSE)。
+本项目以 **MIT License** 分发，全文见仓库根目录的 [LICENSE](LICENSE)。Copyright (c) 2026 yunyu697。
 
-为什么是 GPL-3.0：`Sources/Brimio/NotchShape.swift` 里刘海形状的路径几何（顶部圆角、底部外扩曲线与 `Shape` 的 path 构造）源自一个以 GPL-3.0 授权的上游项目。衍生自 GPL-3.0 代码的作品需要以同一协议分发，因此本仓库采用 GPL-3.0。具体来源、链接与上游 LICENSE 的 sha256 记录在 [NOTICE](NOTICE)。
+对使用者来说（以 LICENSE 全文为准）：
 
-对第三方使用者来说，这意味着（以 LICENSE 全文为准）：
+- 允许使用、复制、修改、合并、发布、再许可与销售，**包括闭源商用**；
+- 唯一义务：在副本或实质部分中保留版权声明与许可声明；
+- 不提供任何担保。
 
-- 分发本项目的源码或二进制（含改动版）时，需要一并提供 GPL-3.0 全文与源码，并保留版权与来源声明；
-- 若分发二进制，还需要让接收者能够获得对应源码；
-- 不能对本项目追加额外限制（例如把衍生作品改成闭源专有分发）；
-- 上游项目的作者与版权持有人保留其各自权利，本项目不改变这一点。
+**为什么从 GPL-3.0 改成 MIT**（2026-11-16）：此前 `LICENSE` 是 GPL-3.0，理由是
+`Sources/Brimio/NotchShape.swift` 的路径几何源自一个 GPL-3.0 的上游项目。这条归因已撤销：
 
-本仓库不附带任何超出 GPL-3.0 的额外授权声明。
+1. 该文件是本项目独立编写，此前记录的是「机制来源」，不是代码复制；
+2. 内凹肩的形状由「端点 + 两端切线」唯一确定，属功能性几何；
+   2026-11-16 把实现改写为等价的三次形式，并把推导写进文件头，不再依赖第三方实现。
+
+撤销依据与细节见 [NOTICE](NOTICE)；几何推导见 `NotchShape.swift` 文件头。
+研究阶段对照过的同类项目只出现在 `Design/SPEC.md` 的取证注里，不构成代码依赖。

@@ -1,17 +1,33 @@
 NOTICE
 
-本仓库以 GNU General Public License v3.0（GPL-3.0）分发，全文见 LICENSE。
+本仓库以 MIT License 分发，全文见 LICENSE。Copyright (c) 2026 yunyu697。
 
-第三方来源
+第三方代码
 ----------
 
-1. NotchShape 的路径几何
+本仓库源码为本项目独立实现，不包含第三方项目的代码。
 
-   - 来源项目：TheBoredTeam/boring.notch
-   - 仓库链接：https://github.com/TheBoredTeam/boring.notch
-   - 上游协议：GNU General Public License v3.0（GPL-3.0）
-   - 上游 LICENSE 文件 sha256：3972dc9744f6499f0f9b2dbf76696f2ae7ad8af9b23dde66d6af86c9dfb36986
-   - 涉及范围：本仓库 `Sources/Brimio/NotchShape.swift` 中刘海形状的路径几何
-     （顶部圆角、底部外扩曲线与 `Shape` 的 path 构造）改写自该项目。
+关于路径几何（2026-11-16 修订）
+------------------------------
 
-以上仅记录来源与协议事实。
+此前本文件记录过一条归因：`Sources/Brimio/NotchShape.swift` 的路径几何「改写自」
+TheBoredTeam/boring.notch（GPL-3.0）。该归因已撤销，原因有两条：
+
+1. **代码表达是本项目自己的。** 形状由「4 条直线 + 4 段曲线」构成，路径构造、
+   参数语义、`animatableData` 插值、命中判定全部为本项目编写；此前的归因描述的是
+   「机制来源」，不是代码复制。
+2. **几何本身由约束唯一确定，属功能性形状。** 端点、两端切线方向一旦给定，
+   内凹肩曲线就被约束死（推导见 `NotchShape.swift` 文件头的约束求解）。
+   2026-11-16 把实现从二次形式改写为等价的三次形式，并把这个推导写成自洽文档，
+   实现不再依赖任何第三方实现。
+
+研究过程中对照过的同类项目（Boring Notch / DynamicNotchKit / NotchDrop / Peninsula）
+仅作为**机制与取证对照**出现在 `Design/SPEC.md` 的取证注里，不构成代码依赖，
+也不影响本仓库的许可。
+
+MIT 的含义（以 LICENSE 全文为准）
+--------------------------------
+
+- 允许使用、复制、修改、合并、发布、再许可与销售，包括闭源商用；
+- 唯一义务：在副本或实质部分中保留版权声明与许可声明；
+- 不提供任何担保，作者不承担使用后果。
