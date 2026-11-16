@@ -13,7 +13,7 @@
 # 用法：
 #   Scripts/fetch-update.sh --feed dist/feed/feed-stable.json --current-app build/Brimio.app
 #   Scripts/fetch-update.sh --feed https://.../feed-beta.json --channel beta --current-build 4
-#   Scripts/fetch-update.sh ... --use-gh            # 私有仓库：用 gh 凭据作为第 0 候选
+#   Scripts/fetch-update.sh ... --use-gh            # 私有仓库：清单与资产都走 gh 凭据
 #   Scripts/fetch-update.sh ... --mirrors-file X    # 换一份镜像清单（本地模拟用）
 #   Scripts/fetch-update.sh ... --dry-run           # 只看有没有更新，不下载
 #
@@ -102,6 +102,35 @@ FEED_RAW="$TMP/feed.json"
 
 fetch_feed() {
     local url="$1"
+    # 私有仓库：**清单也必须走凭据**（RELEASE-PLAN §4.7）。
+    # 匿名 curl 取 `releases/download/...` 在私有仓库下必然 404 —— 那是可见性问题，
+    # 不是「镜像坏了」，所以不能靠重试或换镜像绕过，只能换凭据通道。
+    if [[ "$USE_GH" == "1" && "$url" == https://github.com/*/releases/download/* ]]; then
+        local rest="${url#https://github.com/}"
+        local repo="${rest%%/releases/download/*}"
+        local after="${rest#*/releases/download/}"
+        local tag="${after%%/*}"
+        local asset="${after#*/}"
+        if ! gh auth status >/dev/null 2>&1; then
+            echo "[update] gh 未登录：私有仓库的清单必须用凭据取，本轮跳过" >&2
+            return 3
+        fi
+        local dir="$TMP/feed-gh"
+        rm -rf "$dir"
+        mkdir -p "$dir"
+        if ! gh release download "$tag" --repo "$repo" --pattern "$asset" \
+            --dir "$dir" --clobber >/dev/null 2>&1; then
+            echo "[update] gh 取清单失败：$repo $tag $asset" >&2
+            return 3
+        fi
+        if [[ ! -f "$dir/$asset" ]]; then
+            echo "[update] gh 未落盘清单文件：$asset" >&2
+            return 3
+        fi
+        echo "[update] 清单来源=gh-cli repo=$repo tag=$tag asset=$asset" >&2
+        cat "$dir/$asset"
+        return 0
+    fi
     case "$url" in
         file://*)
             local path="${url#file://}"
