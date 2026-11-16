@@ -26,6 +26,7 @@
 #   DIST=/abs/dir          # zip 输出目录，默认 $ROOT/dist
 #   TAG=v1.0.0-alpha1      # 直接指定版本，优先级高于 git describe（无仓库时演练用）
 #   VERIFY_TAG=v1.0.0...   # CI 传入 ref 上的 tag；与 TAG 不同即 FAIL
+#   SWIFT_DISABLE_SANDBOX=1 # 强制跳过 SwiftPM 清单沙箱（受限环境用，见下方说明）
 #
 # 版本规则（与 Scripts/version-check.sh、CI 同一套）：
 #   有精确 tag  -> CFBundleShortVersionString = tag 去掉 v 与后缀，CFBundleVersion = 提交数
@@ -48,8 +49,49 @@ if [[ -n "${SCRATCH:-}" ]]; then
     BUILD_ARGS+=(--scratch-path "$SCRATCH")
 fi
 
-swift build "${BUILD_ARGS[@]}"
-BIN_DIR="$(swift build "${BUILD_ARGS[@]}" --show-bin-path)"
+# MARK: - 编译
+#
+# SwiftPM 编译清单时会套一层 sandbox-exec。在受限环境（被系统策略收紧的终端、
+# 某些沙箱会话、部分 CI 容器）里这一层直接失败，报：
+#     sandbox-exec: sandbox_apply: Operation not permitted
+# 那是**构建期隔离**不可用，不是代码问题，也不是运行期沙箱。唯一出路是
+# `swift build --disable-sandbox`。
+#
+# 策略：默认仍按原样编译（保留隔离）；只有真的命中那条错误才降级重试一次，
+# 并且明确打 WARN，不静默。已知受限的环境可以设 SWIFT_DISABLE_SANDBOX=1
+# 直接跳过失败的那一次编译。
+SANDBOX_ARGS=()
+
+run_build() {
+    if [[ "${SWIFT_DISABLE_SANDBOX:-0}" == "1" ]]; then
+        SANDBOX_ARGS=(--disable-sandbox)
+        echo "[make-app] WARN SWIFT_DISABLE_SANDBOX=1：跳过 SwiftPM 清单沙箱" >&2
+        swift build "${BUILD_ARGS[@]}" "${SANDBOX_ARGS[@]}"
+        return $?
+    fi
+
+    local log
+    log="$(mktemp -t brimio-build)"
+    if swift build "${BUILD_ARGS[@]}" >"$log" 2>&1; then
+        cat "$log"
+        rm -f "$log"
+        return 0
+    fi
+    if grep -q 'sandbox_apply: Operation not permitted' "$log"; then
+        echo "[make-app] WARN SwiftPM 清单沙箱不可用（sandbox_apply: Operation not permitted），" >&2
+        echo "[make-app] WARN 改用 --disable-sandbox 重试；这是构建期隔离，不影响运行期沙箱" >&2
+        rm -f "$log"
+        SANDBOX_ARGS=(--disable-sandbox)
+        swift build "${BUILD_ARGS[@]}" "${SANDBOX_ARGS[@]}"
+        return $?
+    fi
+    cat "$log"
+    rm -f "$log"
+    return 1
+}
+
+run_build
+BIN_DIR="$(swift build "${BUILD_ARGS[@]}" "${SANDBOX_ARGS[@]}" --show-bin-path)"
 
 # MARK: - 版本注入
 
