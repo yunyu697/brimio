@@ -1,5 +1,6 @@
 import AppKit
 import CoreGraphics
+import Darwin
 import SwiftUI
 
 /// 无屏几何注入。
@@ -78,6 +79,7 @@ let headlessUncovered: [String] = [
     "真实窗口层级与跨屏跟随（屏参变化、热插拔、全屏 App 下的层序）",
     "真实指针位置相关的采样：hover 进入/离开、拖放悬停、⌘ 拖出（--e2e / --animate-probe 不在本模式运行）",
     "屏幕录制与视觉复核（--render / --shadow-probe / --shoulder-probe 需要真实屏）",
+    "菜单栏自动隐藏状态下的信号：不修改用户系统设置，故未实测；若该状态下 auxiliary 双区变 nil，会走保守收缩（内容偏窄，但不会压硬件）",
 ]
 
 /// AppKit 生命周期入口（不使用 SwiftUI App，避免非 bundle 可执行文件的启动差异）。
@@ -85,6 +87,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var controller: NotchWindowController?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
+        // 固定路径日志：`open -n` 启动时 stdout/stderr 会被 LaunchServices 丢掉，
+        // 把 stderr（NSLog 也走这里）重定向到文件，真机验证时可直接读取。
+        if let logPath = flagValue("--log-file=") {
+            freopen(logPath, "a", stderr)
+            setvbuf(stderr, nil, _IOLBF, 0)
+        }
         // 几何注入只影响 selftest；其余模式仍然要求真实屏幕。
         if let spec = HeadlessGeometry.rawSpec(CommandLine.arguments) {
             guard let metrics = HeadlessGeometry.metrics(from: spec) else {
@@ -108,11 +116,30 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             return
         }
 
+        // 原始屏幕信号：只打印系统给的原值，不做任何加工，用来确定刘海矩形的可信来源。
+        if CommandLine.arguments.contains("--screen-signals") {
+            printScreenSignals()
+            exit(0)
+        }
+
+        // 几何探针：不依赖物理屏。注入屏幕与刘海参数，离屏画出闭合态与展开态，
+        // 并在同一坐标系里叠一条「硬件禁画区」标注，用来判定真机遮挡属于哪种参数组合。
+        if let spec = flagValue("--render-geometry=") {
+            runGeometryProbe(
+                spec: spec,
+                outputDirectory: flagValue("--render-out=") ?? NSTemporaryDirectory(),
+                label: flagValue("--label=") ?? "geometry"
+            )
+            return
+        }
+
         guard let screen = NSScreen.main ?? NSScreen.screens.first else {
             NSLog("[Brimio] no screen available")
             NSApp.terminate(nil)
             return
         }
+        // 离屏渲染/探针不建窗口，也要先按真实屏幕注入顶部让位，否则形状高度按默认内边距算。
+        PageMetrics.configure(topInset: NotchHardware.topInset(for: ScreenGeometry.Metrics.from(screen)))
 
         // 离屏渲染模式：不创建真实窗口，避免闪一下。
         if let index = CommandLine.arguments.firstIndex(of: "--render"),
@@ -153,8 +180,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             runMediaProbe()
         } else if CommandLine.arguments.contains("--presence-probe") {
             runPresenceProbe()
+        } else if let captureDir = flagValue("--capture-demo=") {
+            runCaptureDemo(outputDirectory: captureDir)
         } else if CommandLine.arguments.contains("--window-probe") {
             runWindowProbe(screen: screen)
+        } else if let baselineDir = flagValue("--render-baseline=") {
+            runBaseline(outputDirectory: baselineDir, screen: screen)
+        } else if CommandLine.arguments.contains("--render-baseline") {
+            runBaseline(outputDirectory: "outputs/baseline", screen: screen)
         } else if CommandLine.arguments.contains("--shoulder-probe") {
             runShoulderProbe(screen: screen)
         } else if CommandLine.arguments.contains("--animate-probe") {
@@ -211,7 +244,213 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                     + "inset=\(Int(metrics.safeAreaTop))"
             )
 
-            // 1. 窗口存在且在屏幕顶部
+            // 1. 硬件禁画区：唯一来源是 NotchHardware，且必须与 auxiliary 反推一致。
+            if let box = NotchHardware.box(for: metrics) {
+                let derived = metrics.frame.width - (metrics.auxLeftWidth ?? 0) - (metrics.auxRightWidth ?? 0)
+                check(
+                    box.isEstimated ? true : abs(box.rect.width - derived) < 0.01,
+                    "hardware rect matches auxiliary gap",
+                    "width=\(box.rect.width) derived=\(derived) estimated=\(box.isEstimated)"
+                )
+                // 徽标：位置取视图真正用的 `closedBadgeTrailing`，
+                // 按「形状右缘 − 内边距 − 徽标宽」换算到屏幕中心坐标系再比。
+                let badgeVM = NotchViewModel(
+                    closedSize: ScreenGeometry.closedSize(for: metrics),
+                    menuBarHeight: ScreenGeometry.menuBarHeight(for: metrics)
+                )
+                badgeVM.hardwareHalfWidth = NotchHardware.clearanceHalfWidth(for: metrics)
+                badgeVM.applyMedia(
+                    MediaSnapshot(
+                        title: "T", artist: "A", album: "B",
+                        isPlaying: true, artwork: nil, source: .music
+                    ),
+                    permission: .granted
+                )
+                let slot = badgeVM.notchSize.width
+                let badgeLeft = -slot / 2 + badgeVM.closedBadgeOffset + slot
+                    - badgeVM.closedBadgeTrailing - DesignSystem.Size.closedBadge
+                let hardwareRight = box.rect.maxX - metrics.frame.midX
+                check(
+                    badgeLeft - hardwareRight >= NotchHardware.contentGap - 0.01,
+                    "closed badge clears hardware by \(NotchHardware.contentGap)pt",
+                    String(
+                        format: "badgeLeft=%+.1f hardwareRight=%+.1f gap=%+.1f estimated=%@",
+                        badgeLeft, hardwareRight, badgeLeft - hardwareRight,
+                        box.isEstimated ? "true" : "false"
+                    )
+                )
+                // 展开态：整块内容（含 chrome 行）必须落在硬件矩形之下。
+                // 这是展开态唯一的竖向让位规则，水平位置不再承担避让职责。
+                check(
+                    PageMetrics.topInset - box.rect.height >= NotchHardware.contentGap - 0.01,
+                    "expanded content starts below the hardware band",
+                    String(
+                        format: "topInset=%.0f band=%.0f gap=%+.0f",
+                        PageMetrics.topInset, box.rect.height, PageMetrics.topInset - box.rect.height
+                    )
+                )
+            }
+
+            // 1b. 缓存：同一屏幕配置只算一次；配置一变或显式失效必须重算。
+            NotchHardware.invalidateCache()
+            NotchHardware.resetCacheCounters()
+            let firstBox = NotchHardware.box(for: metrics)
+            _ = NotchHardware.box(for: metrics)
+            check(
+                NotchHardware.computeCount == 1,
+                "hardware rect is computed once per screen config",
+                "computeCount=\(NotchHardware.computeCount)"
+            )
+            var changedMetrics = metrics
+            changedMetrics.safeAreaTop += 1
+            _ = NotchHardware.box(for: changedMetrics)
+            check(
+                NotchHardware.computeCount == 2,
+                "screen config change recomputes the rect",
+                "computeCount=\(NotchHardware.computeCount)"
+            )
+            NotchHardware.invalidateCache()
+            _ = NotchHardware.box(for: metrics)
+            check(
+                NotchHardware.computeCount == 3,
+                "invalidation forces recompute",
+                "computeCount=\(NotchHardware.computeCount)"
+            )
+            check(
+                firstBox == NotchHardware.box(for: metrics),
+                "same config yields the same rect"
+            )
+
+            // 1c. 四条形状断言之①③：两态共用同一条构造 + 凹角内必须透背景。
+            //
+            // ① 构造（不依赖数值）：顶部角的第一段是二次贝塞尔，起点 (0,0)、控制点 (t,0)、终点 (t,t)。
+            //    这条与参照实现同构；t 是切点偏移，不是 cornerRadius。
+            let constructionRect = CGRect(x: 0, y: 0, width: 300, height: 148)
+            func shoulderQuad(t: CGFloat) -> (start: CGPoint, control: CGPoint, end: CGPoint)? {
+                let path = NotchShape(topTangentOffset: t, bottomTangentOffset: 24)
+                    .path(in: constructionRect)
+                var start: CGPoint?
+                var quad: (control: CGPoint, end: CGPoint)?
+                path.forEach { element in
+                    switch element {
+                    case .move(let point):
+                        if start == nil { start = point }
+                    case .quadCurve(let to, let control):
+                        if quad == nil { quad = (control, to) }
+                    default:
+                        break
+                    }
+                }
+                guard let start, let quad else { return nil }
+                return (start, quad.control, quad.end)
+            }
+            let constructionOffsets = [
+                ScreenGeometry.shoulderTangentOffset.closed,
+                ScreenGeometry.shoulderTangentOffset.opened
+            ]
+            let constructionOK = constructionOffsets.allSatisfy { t in
+                guard let quad = shoulderQuad(t: t) else { return false }
+                return abs(quad.start.x) < 0.001 && abs(quad.start.y) < 0.001
+                    && abs(quad.control.x - t) < 0.001 && abs(quad.control.y) < 0.001
+                    && abs(quad.end.x - t) < 0.001 && abs(quad.end.y - t) < 0.001
+            }
+            check(
+                constructionOK,
+                "both states share one shoulder construction: control (t,0), end (t,t)",
+                "t=" + constructionOffsets.map { String(format: "%.0f", $0) }.joined(separator: "/")
+                    + "；起点 (0,0) 控点 (t,0) 终点 (t,t)"
+            )
+
+            // ③ 凹角内必须透背景（像素证据）。
+            //   A 空耳 (x0 + 1, top + 1)          —— 两态都必须透出背景（亮度 > 0.4），方角会变黑
+            //   B 实体 (x0 + t + 2, top + t + 2)  —— 必须是黑（亮度 ≤0.05）
+            //   C y = top + t/2 的首个不透明像素必须落在 0.914t：
+            //     内凹解析解 0.914t；外凸圆弧是 0.134t；方角是 0。三者互不重叠。
+            // 采样点（离屏图 scale=3；形状左上角在画布 (40 + (窗口宽 − 形状宽)/2, 40)）。
+            // 若 overscan 用矩形垫底填平两个空耳，A/C 会变黑 → 立刻红。
+            for openState in [false, true] {
+                let probeVM = NotchViewModel(
+                    closedSize: ScreenGeometry.closedSize(for: metrics),
+                    menuBarHeight: ScreenGeometry.menuBarHeight(for: metrics)
+                )
+                probeVM.hardwareHalfWidth = NotchHardware.clearanceHalfWidth(for: metrics)
+                if openState { probeVM.open() }
+                let shape = probeVM.notchSize
+                let t = probeVM.topTangentOffset
+                let tag = openState ? "open" : "closed"
+
+                let canvas = ZStack(alignment: .topLeading) {
+                    Color(red: 0.62, green: 0.64, blue: 0.67)
+                    NotchRootView(
+                        vm: probeVM,
+                        onTap: {},
+                        onSelect: { _ in },
+                        onMediaControl: { _ in },
+                        onOpenPlayerSettings: {},
+                        onDropFiles: { _ in },
+                        onDragOutFile: { _, _ in }
+                    )
+                    .frame(width: ScreenGeometry.windowSize.width, height: ScreenGeometry.windowSize.height)
+                    .offset(x: 40, y: 40)
+                }
+                .frame(width: 720, height: 300)
+
+                guard let rep = renderBitmap(canvas) else {
+                    check(false, "\(tag) concave shoulder keeps the ear transparent", "渲染失败")
+                    continue
+                }
+                let renderScale: CGFloat = 3
+                let x0 = 40 + (ScreenGeometry.windowSize.width - shape.width) / 2
+                let top: CGFloat = 40
+                func lum(_ px: CGFloat, _ py: CGFloat) -> Double? {
+                    guard let c = rep.colorAt(
+                        x: Int((px * renderScale).rounded()),
+                        y: Int((py * renderScale).rounded())
+                    ) else { return nil }
+                    return 0.299 * c.redComponent + 0.587 * c.greenComponent + 0.114 * c.blueComponent
+                }
+                let ears = [lum(x0 + 1, top + 1), lum(x0 + shape.width - 1, top + 1)]
+                let solids = [
+                    lum(x0 + t + 2, top + t + 2),
+                    lum(x0 + shape.width - t - 2, top + t + 2)
+                ]
+                let earsOK = ears.allSatisfy { ($0 ?? 0) > 0.4 }
+                let solidDark = solids.allSatisfy { ($0 ?? 1) < 0.05 }
+                // 首黑扫描：y = top + t/2，从 x0−3 往右扫。
+                var firstOffset: Double = -1
+                let scanY = top + t / 2
+                var scanX = Int(((x0 - 3) * renderScale).rounded())
+                let scanEnd = Int(((x0 + t + 3) * renderScale).rounded())
+                while scanX <= scanEnd {
+                    if let c = rep.colorAt(x: scanX, y: Int((scanY * renderScale).rounded())),
+                       let s = c.usingColorSpace(.sRGB) {
+                        let sr: Double = Double(s.redComponent)
+                        let sg: Double = Double(s.greenComponent)
+                        let sb: Double = Double(s.blueComponent)
+                        let value: Double = 0.299 * sr + 0.587 * sg + 0.114 * sb
+                        if s.alphaComponent > 0.99 && value < 0.05 {
+                            firstOffset = Double(scanX) / Double(renderScale) - Double(x0)
+                            break
+                        }
+                    }
+                    scanX += 1
+                }
+                let analytic = 0.914 * Double(t)
+                let concave = firstOffset >= 0 && abs(firstOffset - analytic) <= 0.6
+                check(
+                    earsOK && solidDark && concave,
+                    "\(tag) concave shoulder: ear transparent, first opaque at 0.914t (t=\(Int(t))pt)",
+                    String(
+                        format: "ear=%.2f/%.2f solid=%.2f/%.2f firstOpaque=+%.2f 期望+%.2f（外凸+%.2f）shape=%.0fx%.0f",
+                        ears[0] ?? -1, ears[1] ?? -1,
+                        solids[0] ?? -1, solids[1] ?? -1,
+                        firstOffset, analytic, 0.134 * Double(t),
+                        shape.width, shape.height
+                    )
+                )
+            }
+
+            // 2. 窗口存在且在屏幕顶部
             check(panel.isVisible, "window is visible")
             check(
                 panel.frame.size == ScreenGeometry.windowSize,
@@ -310,16 +549,92 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             // 3. 初始穿透
             check(panel.ignoresMouseEvents, "collapsed window ignores mouse events")
             check(!vm.isOpen, "initial state is closed")
-            check(vm.topCornerRadius == 6, "closed state keeps 6pt top corners", "\(vm.topCornerRadius)")
+            // 四条形状断言之②：两态取值来源=参照实现（闭合 6 / 展开 19），**不是实测**。
+            // 6→6 标定成立的前提（见 ScreenGeometry.shoulderTangentOffset）：
+            //   同一构造（①）+ 同一窗口侧口径（宽=硬件带+4、闭合高=safeAreaInsets.top、顶边贴屏顶）。
+            // 本机硬件带 179×32 → 闭合 183×32；参照闭合高就是 safeAreaInsets.top，所以高度关系也同口径。
+            let safeTop = ScreenGeometry.current()?.metrics.safeAreaTop ?? 32
+            let closedShoulder = vm.topTangentOffset
+            check(
+                closedShoulder == ScreenGeometry.shoulderTangentOffset.closed
+                    && closedShoulder == 6,
+                "closed shoulder tangent offset = reference 6",
+                String(format: "closed=%.0f 参照闭合=6；闭合宽 %.0f（硬件带 179+4）、高 %.0f = safeAreaTop %.0f",
+                       closedShoulder, ScreenGeometry.closedSize(for: metrics).width,
+                       ScreenGeometry.closedSize(for: metrics).height, safeTop)
+            )
+
+            // 闭合态的内容左右内缩：t 6 + 净间隙 4 = 10（闭合没有页面内容，这里只做布局口径）。
+            let closedContentInset = vm.contentHorizontalInset
 
             // 4. 指针进入 -> 延时展开
             controller.handlePointer(inside: true)
             try? await Task.sleep(nanoseconds: 500_000_000)
             check(vm.isOpen, "hover opens the notch")
             check(!panel.ignoresMouseEvents, "open window receives mouse events")
-            check(vm.notchSize == PageMetrics.shapeSize(for: .home), "open size follows home page content")
+            check(vm.notchSize == PageMetrics.shapeSize(for: .home, home: .empty),
+                  "open size follows home page content")
             check(panel.frame.size == ScreenGeometry.windowSize, "window frame unchanged after open")
-            check(vm.topCornerRadius == 0, "open state has square top corners", "\(vm.topCornerRadius)")
+            // ②（续）：展开态取参照的 19，不要求与闭合同值——同族是构造相同，不是数值相同。
+            check(
+                vm.topTangentOffset == ScreenGeometry.shoulderTangentOffset.opened
+                    && vm.topTangentOffset == 19,
+                "open shoulder tangent offset = reference 19 (same dimension, 6→6 calibrated)",
+                String(format: "open=%.0f 参照展开=19；比值 %.2f，参照 19/6=%.2f；绝对值均未实测",
+                       vm.topTangentOffset, vm.topTangentOffset / closedShoulder, 19.0 / 6.0)
+            )
+
+            // ④ top 同时驱动「内容左右内缩」与「顶部 1pt 遮缝条横向内缩」：
+            //   内缩 = t + NotchHardware.contentGap(4) → 闭合 10 / 展开 23。
+            //   内容盒因此始终在侧壁内侧（旧实现固定 16，展开 t=19 时被裁 3pt）。
+            let insetClosed = ScreenGeometry.contentInsetExpectation(isOpen: false)
+            let insetOpen = ScreenGeometry.contentInsetExpectation(isOpen: true)
+            check(
+                closedContentInset == 10 && vm.contentHorizontalInset == 23
+                    && vm.contentHorizontalInset - vm.topTangentOffset == NotchHardware.contentGap,
+                "top-driven content inset: closed 10 / open 23 (= t + 4pt gap)",
+                String(format: "闭合 %.0f = %.0f+%.0f；展开 %.0f = %.0f+%.0f；遮缝条同步 %.0f/%.0f",
+                       closedContentInset, insetClosed, NotchHardware.contentGap,
+                       vm.contentHorizontalInset, insetOpen, NotchHardware.contentGap,
+                       insetClosed, insetOpen)
+            )
+
+            // 底部：bottom 仍取 24，t=19 后侧壁与底边直线段是否还够（不够才需要把 bottom 也纳入状态驱动）。
+            //   侧壁 = height − t − bottom；底边直线段 = width − 2×bottom。
+            let openSizes = ExpandedItem.allCases.map {
+                PageMetrics.shapeSize(for: $0, shelfCount: PageMetrics.overflowShelfCount)
+            }
+            let minWall = openSizes.map { $0.height - 19 - 24 }.min() ?? 0
+            let minBottomStraight = openSizes.map { $0.width - 24 * 2 }.min() ?? 0
+            check(
+                minWall > 0 && minBottomStraight > 0,
+                "bottom stays 24: vertical wall and bottom straight are still positive",
+                String(format: "侧壁最小 %.0fpt（= 高 − 19 − 24）；底边直线段最小 %.0fpt（= 宽 − 48）；不需要状态驱动",
+                       minWall, minBottomStraight)
+            )
+
+            // 竖向预算：top + bottom 必须严格小于面板高度，否则上/下切角互相吃、直边变负。
+            let closedInsets = ScreenGeometry.cornerRadiusInsets.closed
+            let closedHeight = ScreenGeometry.closedSize(for: metrics).height
+            let closedBudget = closedInsets.top + closedInsets.bottom
+            check(
+                closedBudget < closedHeight,
+                "closed vertical budget: top + bottom < panel height",
+                String(format: "%.0f + %.0f = %.0f < %.0f（余量 %.0fpt）",
+                       closedInsets.top, closedInsets.bottom, closedBudget, closedHeight,
+                       closedHeight - closedBudget)
+            )
+            let openInsets = ScreenGeometry.cornerRadiusInsets.opened
+            let openHeight = openSizes.map(\.height).min() ?? 0
+            let openHeightMax = openSizes.map(\.height).max() ?? 0
+            let openBudget = openInsets.top + openInsets.bottom
+            check(
+                openBudget < openHeight,
+                "open vertical budget: top + bottom < panel height",
+                String(format: "%.0f + %.0f = %.0f < 最小页高 %.0f（最大页高 %.0f，余量 %.0fpt）",
+                       openInsets.top, openInsets.bottom, openBudget, openHeight, openHeightMax,
+                       openHeight - openBudget)
+            )
 
             // 4b. 分页路由：三页都能到达；切页不改开合状态，尺寸跟着页面内容走
             check(vm.route == .home, "default route is home")
@@ -333,7 +648,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 "every tab reachable",
                 visited.map(\.title).joined(separator: ",")
             )
-            let homeSize = PageMetrics.shapeSize(for: .home)
+            let homeSize = PageMetrics.shapeSize(for: .home, home: .empty)
             let sizeKeys = ExpandedItem.allCases.map { "\($0.shapeSize.width)x\($0.shapeSize.height)" }
             check(
                 Set(sizeKeys).count == ExpandedItem.allCases.count,
@@ -341,22 +656,26 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 ExpandedItem.allCases.map { "\($0.title)=\(Int($0.shapeSize.width))x\(Int($0.shapeSize.height))" }
                     .joined(separator: " ")
             )
-            // 高度必须严格等于「chrome + 间距 + 内容自然高 + 上下同一档 padding」：
+            // 高度必须严格等于「顶部让位 + chrome + 间距 + 内容自然高 + 底部 padding」：
             // 一旦某页被下限/中间档夹住，这个等式就不成立。
             let padding = PageMetrics.contentPadding
+            let topInset = PageMetrics.topInset
             let fixedChrome = PageMetrics.chromeHeight + PageMetrics.rowSpacing
+            let horizontalInset = PageMetrics.openContentHorizontalInset
             let paddingMath = ExpandedItem.allCases.allSatisfy { item in
                 let shape = PageMetrics.shapeSize(for: item)
-                return abs(shape.width - (item.contentSize.width + padding * 2)) < 0.001
-                    && abs(shape.height - (item.contentSize.height + fixedChrome + padding * 2)) < 0.001
+                return abs(shape.width - (item.contentSize.width + horizontalInset * 2)) < 0.001
+                    && abs(shape.height - (item.contentSize.height + fixedChrome + topInset + padding)) < 0.001
             }
             check(
                 paddingMath,
-                "all four sides share one padding token",
+                "panel height = top inset + chrome + spacing + content + bottom padding",
                 ExpandedItem.allCases.map {
                     "\($0.title) 内容\(Int($0.contentSize.width))x\(Int($0.contentSize.height))"
-                        + " + chrome\(Int(PageMetrics.chromeHeight)) + 间距\(Int(PageMetrics.rowSpacing))"
-                        + " + \(Int(padding))*2 = \(Int($0.shapeSize.width))x\(Int($0.shapeSize.height))"
+                        + " + 左右\(Int(horizontalInset))"
+                        + " + 顶部\(Int(topInset)) + chrome\(Int(PageMetrics.chromeHeight))"
+                        + " + 间距\(Int(PageMetrics.rowSpacing)) + 底部\(Int(padding))"
+                        + " = \(Int($0.shapeSize.width))x\(Int($0.shapeSize.height))"
                 }.joined(separator: "；")
             )
             check(
@@ -441,42 +760,101 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             )
             let ratiosSumToOne = ExpandedItem.allCases.allSatisfy { item in
                 let b = PageMetrics.heightBudget(for: item)
-                return abs(b.contentRatio + b.chromeRatio + b.overheadRatio - 1) < 1e-9
+                return abs(b.contentRatio + b.chromeRatio + b.overheadRatio + b.clearanceRatio - 1) < 1e-9
             }
             check(
                 ratiosSumToOne,
-                "the three height shares sum to 100%",
+                "the four height shares sum to 100%",
                 ExpandedItem.allCases.map {
                     let b = PageMetrics.heightBudget(for: $0)
                     return String(
-                        format: "%@ 内容%.1f%% / chrome %.1f%% / padding+间距 %.1f%%",
-                        $0.title, b.contentRatio * 100, b.chromeRatio * 100, b.overheadRatio * 100
+                        format: "%@ 内容%.1f%% / chrome %.1f%% / padding+间距 %.1f%% / 系统让位 %.1f%%",
+                        $0.title, b.contentRatio * 100, b.chromeRatio * 100,
+                        b.overheadRatio * 100, b.clearanceRatio * 100
                     )
                 }.joined(separator: "；")
             )
-            // 首页是媒体页：实际内容块必须是三个桶里最大的一份，
+            // 首页是媒体页：实际内容块必须比「我们可控的两块」（自有留白、chrome）都大，
             // 否则说明 chrome 或留白又比内容还占地方。
+            // 系统让位（刘海硬件带）单列，不计入这条比较：它不是设计选择。
             let homeBudget = PageMetrics.heightBudget(for: .home)
             check(
                 homeBudget.content > homeBudget.chrome && homeBudget.content > homeBudget.overhead,
-                "home content block is the largest of the three shares",
+                "home content block beats the padding and chrome it pays for",
                 String(
-                    format: "内容 %.1f%% (%d/%d) > padding+间距 %.1f%% > chrome %.1f%%",
-                    homeBudget.contentRatio * 100,
-                    Int(homeBudget.content), Int(homeBudget.total),
-                    homeBudget.overheadRatio * 100, homeBudget.chromeRatio * 100
+                    format: "内容 %d > 自有留白 %d、chrome %d（另加系统让位 %d）",
+                    Int(homeBudget.content), Int(homeBudget.overhead),
+                    Int(homeBudget.chrome), Int(homeBudget.clearance)
                 )
             )
-            // 份额下限对**每一页**生效：内容块不得低于面板高度的 30%。
-            // 豁免页写死在 PageMetrics.contentShareExemptions 里，这里逐页打印。
+            // 份额门禁分两种口径：内容 ≥ 60pt 的页面比 30%，更小的页面比「固定开销 92 不随内容增长」。
+            // 报告按真实比较结果输出「达标 / 不达标」，不无条件印「≥ 下限」。
             for item in ExpandedItem.allCases {
                 print("[SHARE] \(PageMetrics.contentShareReport(for: item))")
             }
             let belowFloor = ExpandedItem.allCases.filter { !PageMetrics.contentShareVerdict(for: $0).passes }
             check(
                 belowFloor.isEmpty,
-                "every page keeps content above \(Int(PageMetrics.minContentRatio * 100))% of panel height",
+                "every page passes its content rule (30% floor for content ≥ 60pt, fixed overhead below)",
                 ExpandedItem.allCases.map { PageMetrics.contentShareReport(for: $0) }.joined(separator: "；")
+            )
+            // 规范 §7.2 高度表：每个可区分布局态都必须落在表内，期望值写死。
+            let specHeights: [(name: String, size: CGSize)] = [
+                ("home.playing", PageMetrics.shapeSize(for: .home, home: .playing)),
+                ("home.presenceOnly", PageMetrics.shapeSize(for: .home, home: .presenceOnly)),
+                ("home.permissionDenied", PageMetrics.shapeSize(for: .home, home: .permissionDenied)),
+                ("home.empty", PageMetrics.shapeSize(for: .home, home: .empty)),
+                ("players.0", PageMetrics.shapeSize(for: .players, playersEnabled: 0)),
+                ("players.1", PageMetrics.shapeSize(for: .players, playersEnabled: 1)),
+                ("players.2", PageMetrics.shapeSize(for: .players, playersEnabled: 2)),
+            ]
+            let expectedHeights: [String: CGFloat] = [
+                "home.playing": 148, "home.presenceOnly": 120, "home.permissionDenied": 120,
+                "home.empty": 107, "players.0": 166, "players.1": 194, "players.2": 222,
+            ]
+            let heightTableOK = specHeights.allSatisfy { expectedHeights[$0.name] == $0.size.height }
+            check(
+                heightTableOK,
+                "sub-state heights match SPEC §7.2 (148/120/120/107, 166/194/222)",
+                specHeights.map { "\($0.name)=\(Int($0.size.height))" }.joined(separator: " ")
+            )
+            // H = 92 + C：C 只按行高求和，没有声明槽位/Spacer/比例分配。
+            let contentHeights: [String: CGFloat] = [
+                "home.playing": PageMetrics.homeContentHeight(.playing),
+                "home.presenceOnly": PageMetrics.homeContentHeight(.presenceOnly),
+                "home.permissionDenied": PageMetrics.homeContentHeight(.permissionDenied),
+                "home.empty": PageMetrics.homeContentHeight(.empty),
+                "players.0": PageMetrics.playersContentHeight(enabledCount: 0),
+                "players.1": PageMetrics.playersContentHeight(enabledCount: 1),
+                "players.2": PageMetrics.playersContentHeight(enabledCount: 2),
+            ]
+            let heightFormulaOK = specHeights.allSatisfy { entry in
+                guard let content = contentHeights[entry.name] else { return false }
+                return abs(entry.size.height - (PageMetrics.fixedOverhead + content)) < 0.001
+            }
+            check(
+                heightFormulaOK && PageMetrics.fixedOverhead == 92,
+                "H = 92 + C for every sub-state",
+                specHeights.map { entry in
+                    "\(entry.name): \(Int(entry.size.height)) = 92 + \(Int(contentHeights[entry.name] ?? -1))"
+                }.joined(separator: "；")
+            )
+            // 内容盒 23 由骨架注入一次；设置页按钮是整行持久填充面，再内缩 4 → 27、宽 246。
+            let fillInset = DesignSystem.Spacing.xs
+            let settingsButtonWidth = ExpandedItem.players.contentSize.width - fillInset * 2
+            check(
+                PageMetrics.openContentHorizontalInset == 23
+                    && PageMetrics.openContentHorizontalInset + fillInset == 27
+                    && settingsButtonWidth == 246,
+                "settings button fill face is inset 4 inside the 23pt content box (246 @ 27)",
+                "内容盒=\(Int(PageMetrics.openContentHorizontalInset)) 填充面=\(Int(PageMetrics.openContentHorizontalInset + fillInset))"
+                    + " 宽=\(Int(settingsButtonWidth))"
+            )
+            // 文案表档位：两处真实文案都是单行档 → 122 这一档当前不可达（不是漏测）。
+            check(
+                HomeCopyTable.emptyLines == 1 && HomeCopyTable.deniedLines == 1,
+                "home copy table declares single-line tiers (107 / 120); 122 reserved for a declared 2-line tier",
+                "emptyLines=\(HomeCopyTable.emptyLines) deniedLines=\(HomeCopyTable.deniedLines)"
             )
             vm.select(.files)
             check(vm.isOpen, "switching tab keeps the notch open")
@@ -507,10 +885,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
             // 6. 文件架：五个状态各自断言尺寸与份额（不能只测空架）
             //
-            // 尺寸表来自 DESIGN.md：空架/1 条 104，2 条 144，3 条 184，≥4 条 212（视口 140）。
+            // 尺寸表来自 DESIGN.md：空架/1 条 124，2 条 164，3 条 204，≥4 条 232（视口 140）。
             // 逐状态打印，方便和文档表格逐行核对。
             let shelfStates: [(count: Int, height: CGFloat)] = [
-                (0, 104), (1, 104), (2, 144), (3, 184), (4, 212)
+                (0, 124), (1, 124), (2, 164), (3, 204), (4, 232)
             ]
             var shelfStateLines: [String] = []
             var shelfStatesPass = true
@@ -530,12 +908,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             }
             check(
                 shelfStatesPass,
-                "file shelf holds its size and content share in all five states",
+                "file shelf holds its size and content rule in all five states",
                 shelfStateLines.joined(separator: "；")
             )
             check(
-                PageMetrics.maxSize.height == 212,
-                "panel height cap stays at 212pt",
+                PageMetrics.maxSize.height == 232,
+                "panel height cap stays at 232pt",
                 "\(Int(PageMetrics.maxSize.height))pt"
             )
             // 文件架的高度必须真的跟着条目数走：否则上面五条会一起退化成同一个值。
@@ -543,7 +921,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 PageMetrics.shapeSize(for: .files, shelfCount: $0.count).height
             }
             check(
-                shelfHeights == [104, 104, 144, 184, 212],
+                shelfHeights == [124, 124, 164, 204, 232],
                 "file shelf height is derived from the entry count",
                 shelfHeights.map { "\(Int($0))" }.joined(separator: " / ")
             )
@@ -618,6 +996,75 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 "copy drag keeps the entry and the original file",
                 "items=\(vm.shelfItems.count)"
             )
+
+            // 7b. 拖出源：只写 .fileURL；会话结束的 operation 决定条目去留。
+            // 拖出不走 SwiftUI `.onDrag`（拿不到结束时的 move/copy），
+            // 这里断言的是 `NSDraggingSource` 直接调用的那个出口。
+            let dragOutFile = makeShelfFile("拖出.txt", bytes: 256)
+            _ = vm.addShelfFiles([dragOutFile])
+            let dragItem = FileShelfDragOutHandle.pasteboardItem(for: dragOutFile)
+            check(
+                dragItem.types == [.fileURL]
+                    && dragItem.string(forType: .fileURL) == dragOutFile.absoluteString,
+                "drag-out offers only .fileURL (same type as drag-in)",
+                "types=\(dragItem.types.map(\.rawValue)) value=\(dragItem.string(forType: .fileURL) ?? "-")"
+            )
+            let dragSource = ShelfDragOutSource(url: dragOutFile) { operation in
+                vm.applyShelfDragOut(dragOutFile, operation: operation)
+            }
+            check(
+                ShelfDragOutSource.operations(for: []) == [.copy]
+                    && ShelfDragOutSource.operations(for: .command) == [.move],
+                "drag-out defaults to copy and allows move only with Command",
+                "none=\(ShelfDragOutSource.operations(for: []).rawValue)"
+                    + " command=\(ShelfDragOutSource.operations(for: .command).rawValue)"
+            )
+            dragSource.finished(operation: .copy)
+            check(
+                vm.shelfItems.contains { $0.url.path == dragOutFile.path }
+                    && FileManager.default.fileExists(atPath: dragOutFile.path),
+                "copy drag-out keeps the entry",
+                "items=\(vm.shelfItems.count)"
+            )
+            dragSource.finished(operation: .move)
+            check(
+                !vm.shelfItems.contains { $0.url.path == dragOutFile.path },
+                "move drag-out removes the entry immediately",
+                vm.shelfItems.map(\.name).joined(separator: " / ")
+            )
+
+            // 7c. 拖动期间整窗可交互：透明边缘上的 drop 必须被形状路径挡掉，
+            // 拖入自动滚动只在视口上下 1/2 行内走一行。
+            let closedShape = NotchShape(
+                topTangentOffset: ScreenGeometry.cornerRadiusInsets.closed.top,
+                bottomTangentOffset: ScreenGeometry.cornerRadiusInsets.closed.bottom
+            )
+            let closedRect = CGRect(origin: .zero, size: ScreenGeometry.closedSize(for: metrics))
+            let shapeGuard: (CGPoint) -> Bool = { closedShape.contains($0, in: closedRect) }
+            let cornerPoint = CGPoint(x: 1, y: 1)
+            let centerPoint = CGPoint(x: closedRect.midX, y: closedRect.midY)
+            check(
+                !FileDropDelegate.accepts(hasFileURL: true, location: cornerPoint, shapeContains: shapeGuard)
+                    && FileDropDelegate.accepts(hasFileURL: true, location: centerPoint, shapeContains: shapeGuard)
+                    && !FileDropDelegate.accepts(hasFileURL: false, location: centerPoint, shapeContains: nil),
+                "drop is accepted only inside the notch path and only for .fileURL",
+                "corner(1,1)=\(shapeGuard(cornerPoint) ? "inside" : "outside")"
+                    + " center(\(Int(centerPoint.x)),\(Int(centerPoint.y)))=\(shapeGuard(centerPoint) ? "inside" : "outside")"
+            )
+            let viewport = FileShelfLayout.viewportHeight
+            let scrollSteps = [
+                FileShelfLayout.autoScrollStep(localY: viewport - 1, viewportHeight: viewport, currentIndex: 0, count: 4),
+                FileShelfLayout.autoScrollStep(localY: 1, viewportHeight: viewport, currentIndex: 2, count: 4),
+                FileShelfLayout.autoScrollStep(localY: viewport / 2, viewportHeight: viewport, currentIndex: 1, count: 4),
+                FileShelfLayout.autoScrollStep(localY: viewport - 1, viewportHeight: viewport, currentIndex: 3, count: 4),
+                FileShelfLayout.autoScrollStep(localY: 1, viewportHeight: viewport, currentIndex: 0, count: 4)
+            ]
+            check(
+                scrollSteps == [1, 1, nil, nil, nil],
+                "drag auto-scroll steps one row at the viewport edges only",
+                scrollSteps.map { $0.map(String.init) ?? "nil" }.joined(separator: ",")
+            )
+
             vm.clearShelf()
             check(vm.shelfItems.isEmpty, "clearing removes references only")
 
@@ -680,24 +1127,59 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 "view layer uses only DesignSystem tokens",
                 lint.violations.isEmpty ? "\(lint.checkedFiles.count) file(s) clean" : "\(lint.violations.count) violation(s)"
             )
-            // 负向用例：递归必须真的生效。临时目录里造 `Views/FakeView.swift`（含裸数值），
+            // 「偷偷缩字号」的红线：全仓（含豁免文件）minimumScaleFactor 必须为零。
+            let scaleHits = DesignLint.minimumScaleFactorHits()
+            check(
+                scaleHits.isEmpty,
+                "minimumScaleFactor is gone from every source file (exemptions included)",
+                scaleHits.isEmpty ? "0 hit(s)" : scaleHits.joined(separator: " | ")
+            )
+            check(
+                DesignLint.horizontalInsetWhitelist.allSatisfy { !$0.reason.isEmpty },
+                "every horizontal-inset exemption states a reason",
+                DesignLint.horizontalInsetWhitelist
+                    .map { "\($0.path)：\($0.reason)" }.joined(separator: "；")
+            )
+            // 负向用例：递归必须真的生效，三条新规则必须真的会命中。
+            // 临时目录里造 `Views/FakeView.swift`（含裸数值 + minimumScaleFactor），
             // 若扫描退回「只列顶层目录」，这个文件根本不会被发现，这条就会 FAIL。
             let probeRoot = URL(fileURLWithPath: NSTemporaryDirectory())
                 .appendingPathComponent("lint-recursive-probe-\(UUID().uuidString)", isDirectory: true)
             let probeSub = probeRoot.appendingPathComponent("Views", isDirectory: true)
             try? FileManager.default.createDirectory(at: probeSub, withIntermediateDirectories: true)
-            try? "struct FakeView: View { var body: some View { Text(\"x\").padding(8) } }"
-                .write(
-                    to: probeSub.appendingPathComponent("FakeView.swift"),
-                    atomically: true,
-                    encoding: .utf8
-                )
-            let probe = DesignLint.scanUI(root: probeRoot, exemptions: [])
+            let probeScaleCall = "." + "minimumScale" + "Factor" + "(0.9)"
+            let probeSource = """
+            struct FakeView: View {
+                var body: some View {
+                    Text("x")
+                        \(probeScaleCall)
+                        .padding(.horizontal, 8)
+                        .font(.system(size: 12))
+                }
+            }
+            """
+            try? probeSource.write(
+                to: probeSub.appendingPathComponent("FakeView.swift"),
+                atomically: true,
+                encoding: .utf8
+            )
+            let probe = DesignLint.scanUI(root: probeRoot, exemptions: [], horizontalInsetWhitelist: [])
             let probeHit = probe.violations.contains { $0.hasPrefix("Views/FakeView.swift") }
+            let probeScaleHit = probe.violations.contains {
+                $0.hasPrefix("Views/FakeView.swift:4:") && $0.contains("minimumScaleFactor")
+            }
+            let probeInsetHit = probe.violations.contains {
+                $0.hasPrefix("Views/FakeView.swift:5:") && $0.contains("水平内边距")
+            }
+            let probeFontHit = probe.violations.contains {
+                $0.hasPrefix("Views/FakeView.swift:6:") && $0.contains("裸字号")
+            }
             check(
-                probe.discoveredFiles == ["Views/FakeView.swift"] && probeHit,
-                "recursion proven by a negative case in a temp subdirectory",
+                probe.discoveredFiles == ["Views/FakeView.swift"] && probeHit
+                    && probeScaleHit && probeInsetHit && probeFontHit,
+                "recursion and the three new rules proven by a negative case in a temp subdirectory",
                 "discovered=\(probe.discoveredFiles.count) violations=\(probe.violations.count) "
+                    + "scale=\(probeScaleHit) inset=\(probeInsetHit) font=\(probeFontHit) "
                     + "first=\(probe.violations.first ?? "-")"
             )
             try? FileManager.default.removeItem(at: probeRoot)
@@ -871,6 +1353,114 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 return (sizeIntermediate, shapeIntermediate, peak)
             }
 
+            /// 反向阶段的量化：真实转向点前后的速度、平台期、回弹。
+            ///
+            /// 为什么不在 `vm.close()` 那一行取速度：状态变更要等到下一个 SwiftUI
+            /// transaction 才进渲染层，实测滞后 1–2 帧（本次 27ms），那几帧仍是展开动画。
+            /// 所以先找「调用之后最高的那一帧」作为真实转向点，再在它两侧取速度。
+            ///
+            /// 判据（任一成立即视为可复现问题）：
+            /// - 平台期：转向后、到达终值前，连续 |Δh| < 0.2pt 累计 ≥ 40ms；
+            /// - 回弹：转向后高度再往回长 > 2pt；
+            /// - 速度断点：转向后首帧速度 < 转向前的 25%（曲线从 0 重新起动）。
+            ///   这一条本轮只报数，不修：它属于「速度继承」那条线。
+            func analyzeReverse(
+                samples: [(time: TimeInterval, size: CGSize)],
+                reversalTime: TimeInterval,
+                fromHeight: CGFloat,
+                toHeight: CGFloat
+            ) -> (hasBreak: Bool, plateauMs: Double, velocityBefore: Double,
+                  velocityAfter: Double, jitter: Int, growth: CGFloat, latencyMs: Double) {
+                let before = samples.filter { $0.time <= reversalTime }
+                let after = samples.filter { $0.time > reversalTime }
+                guard before.count >= 2, after.count >= 3 else {
+                    print("[ANIM] reverse 采样不足 before=\(before.count) after=\(after.count)")
+                    return (false, 0, 0, 0, 0, 0, 0)
+                }
+
+                /// 段速度 pt/s（正 = 高度在长）。
+                func velocity(_ a: (time: TimeInterval, size: CGSize),
+                              _ b: (time: TimeInterval, size: CGSize)) -> Double {
+                    let dt = b.time - a.time
+                    guard dt > 0 else { return 0 }
+                    return Double(b.size.height - a.size.height) / dt
+                }
+
+                // 真实转向点：调用之后高度最大的那一帧。
+                var peakIndex = 0
+                for index in after.indices where after[index].size.height > after[peakIndex].size.height {
+                    peakIndex = index
+                }
+                let turn = after[peakIndex]
+                let latencyMs = (turn.time - reversalTime) * 1000
+
+                // 转向前后各取一段（最多 2 帧）的速度。
+                let preStart = max(0, peakIndex - 2)
+                let velocityBefore = peakIndex > preStart ? velocity(after[preStart], turn) : 0
+                let postEnd = min(after.count - 1, peakIndex + 1)
+                let velocityAfter = postEnd > peakIndex ? velocity(turn, after[postEnd]) : 0
+
+                // 平台期：只统计「还在往终值走」的阶段（距终值 > 1pt），
+                // 否则弹簧尾段本来就有大量 < 0.2pt 的收敛帧，会被误算成停顿。
+                var longestRun = 0.0
+                var run = 0.0
+                var index = peakIndex + 1
+                while index < after.count, abs(after[index].size.height - toHeight) > 1 {
+                    let dt = (after[index].time - after[index - 1].time) * 1000
+                    let dh = abs(after[index].size.height - after[index - 1].size.height)
+                    if dh < 0.2 {
+                        run += dt
+                        longestRun = max(longestRun, run)
+                    } else {
+                        run = 0
+                    }
+                    index += 1
+                }
+
+                // 回弹/抖动：转向前后是否还出现过更高的帧、以及转向后方向变了几次。
+                // 真正看得见的问题是「关到一半又往回长」，不是弹簧尾段的微分噪声。
+                let growth = turn.size.height - before.last!.size.height
+                var jitter = 0
+                var direction = 0
+                for item in (peakIndex + 1)..<after.count {
+                    let dh = after[item].size.height - after[item - 1].size.height
+                    guard abs(dh) >= 0.2 else { continue }
+                    let sign = dh > 0 ? 1 : -1
+                    if direction != 0, sign != direction { jitter += 1 }
+                    direction = sign
+                }
+
+                // 转向前后各 6 帧的原始序列：时间相对 `vm.close()`（ms）、高度。
+                let windowSamples = before.suffix(6) + after.prefix(12)
+                let series = windowSamples.map { sample -> String in
+                    String(format: "%.0f:%.1f", (sample.time - reversalTime) * 1000, sample.size.height)
+                }.joined(separator: ",")
+                let head = Array(after.prefix(12))
+                let velocitySeries = head.enumerated().map { item, sample -> String in
+                    guard item > 0 else { return "-" }
+                    return String(format: "%.0f", velocity(head[item - 1], sample))
+                }.joined(separator: ",")
+                print("[ANIM] reverse t_ms:h series=\(series)")
+                print("[ANIM] reverse vAfter(pt/s)/frame=\(velocitySeries)")
+
+                let speedRatio = abs(velocityBefore) > 1
+                    ? abs(velocityAfter / velocityBefore) : 0
+                // 速度断点只在「转向前确实在动」时才算（>150pt/s），否则转向点本来就是峰。
+                let hasBreak = abs(velocityBefore) > 150 && speedRatio < 0.25
+                let hasPlateau = longestRun >= 40
+                print(String(
+                    format: "[ANIM] reverse turn latency=%.0fms h=%.1f vBefore=%+.0fpt/s vAfter=%+.0fpt/s ratio=%.2f plateau=%.0fms jitter=%d growth=%+.1fpt range=%.0f→%.0f",
+                    latencyMs, turn.size.height, velocityBefore, velocityAfter, speedRatio,
+                    longestRun, jitter, growth, fromHeight, toHeight
+                ))
+                let verdict = (hasBreak || hasPlateau || jitter > 0)
+                    ? "可复现：断点=\(hasBreak) 平台期=\(hasPlateau) 抖动=\(jitter)"
+                    : "无可复现问题"
+                print("[ANIM] reverse verdict=\(verdict)")
+                return (hasBreak || hasPlateau || jitter > 0, longestRun,
+                        velocityBefore, velocityAfter, jitter, growth, latencyMs)
+            }
+
             NotchLayoutProbe.reset()
             NotchLayoutProbe.isEnabled = true
 
@@ -895,8 +1485,23 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 toHeight: closedHeight
             )
 
-            NotchLayoutProbe.isEnabled = false
+            // 反向：展开 100ms 后立即收起，采整段尺寸序列。
+            // 目的只有一个：证明中途反向有没有速度断点或平台期，而不是靠肉眼看。
+            // 速度继承是另一条线（本轮不写），这里只量「反向那一刻速度掉到多少」。
+            NotchLayoutProbe.reset()
+            vm.open()
+            try? await Task.sleep(nanoseconds: 100_000_000)
+            let reversalTime = ProcessInfo.processInfo.systemUptime
+            vm.close()
+            try? await Task.sleep(nanoseconds: 1_500_000_000)
+            let reverse = analyzeReverse(
+                samples: NotchLayoutProbe.samples,
+                reversalTime: reversalTime,
+                fromHeight: openHeight,
+                toHeight: closedHeight
+            )
 
+            NotchLayoutProbe.isEnabled = false
             // 动画全程都必须落在窗口内：宽度超调不能超过窗口宽度，否则中间帧侧边被平切。
             let window = ScreenGeometry.windowSize
             let peak = CGSize(
@@ -910,14 +1515,23 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
             // 判定标准：两个阶段都必须采到 ≥3 个严格位于首尾之间的尺寸，圆角也有中间值，
             // 并且整段动画的峰值尺寸都没超出窗口。
+            // 反向断言只卡「可用肉眼看到的问题」：中途平台期与关到一半往回长。
+            // 速度断点（曲线从 0 重新起动）属于速度继承那条线，不在本门禁里判红。
+            let reverseClean = reverse.plateauMs < 40 && reverse.jitter == 0
             let pass = openResult.sizeIntermediate >= 3 && closeResult.sizeIntermediate >= 3
                 && openResult.shapeIntermediate >= 3 && closeResult.shapeIntermediate >= 3
-                && contained
+                && contained && reverseClean
             print(pass
                   ? "[ANIM] PASS animation interpolates: open size=\(openResult.sizeIntermediate) shape=\(openResult.shapeIntermediate),"
                     + " close size=\(closeResult.sizeIntermediate) shape=\(closeResult.shapeIntermediate), contained=true"
                   : "[ANIM] FAIL: open size=\(openResult.sizeIntermediate) shape=\(openResult.shapeIntermediate),"
                     + " close size=\(closeResult.sizeIntermediate) shape=\(closeResult.shapeIntermediate), contained=\(contained)")
+            // 反向探针只报数据，不改开合判定：这轮先证明有没有问题，再决定修法。
+            print(String(
+                format: "[ANIM] reverse summary break=%d plateau=%.0fms jitter=%d growth=%+.1fpt latency=%.0fms vBefore=%+.0f vAfter=%+.0f",
+                reverse.hasBreak ? 1 : 0, reverse.plateauMs, reverse.jitter,
+                reverse.growth, reverse.latencyMs, reverse.velocityBefore, reverse.velocityAfter
+            ))
             exit(pass ? 0 : 2)
         }
     }
@@ -934,6 +1548,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         case denied
         /// 只有播放状态（IOPM 通道）：闭合态应当出现播放器图标、且没有任何文字。
         case presence
+
+        /// 夹具对应的首页版式：基线用它挑高度档位，不再靠「所有首页态同高」的假设。
+        var homeLayout: HomeLayout {
+            switch self {
+            case .none, .empty: return .empty
+            case .denied: return .permissionDenied
+            case .playing: return .playing
+            case .presence: return .presenceOnly
+            }
+        }
     }
 
     /// 夹具封面：画一张 112×112 的色块（离屏渲染没有真实封面可读）。
@@ -979,6 +1603,327 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
+    /// 取形如 `--flag=value` 的参数值；没给就返回 nil。
+    private func flagValue(_ prefix: String) -> String? {
+        CommandLine.arguments.first { $0.hasPrefix(prefix) }.map { String($0.dropFirst(prefix.count)) }
+    }
+
+    /// 打印所有可能用于反推刘海矩形的系统信号，原值输出，不做加工。
+    @MainActor
+    private func printScreenSignals() {
+        var size = 0
+        sysctlbyname("hw.model", nil, &size, nil, 0)
+        var model = [CChar](repeating: 0, count: max(size, 1))
+        sysctlbyname("hw.model", &model, &size, nil, 0)
+        let modelString = String(cString: model)
+        print("[SIGNALS] hw.model=\(modelString)")
+        let hidden = UserDefaults.standard.persistentDomain(forName: "NSGlobalDomain")?["_HIHideMenuBar"] as? Bool
+        print("[SIGNALS] _HIHideMenuBar=\(hidden.map(String.init) ?? "nil")")
+        print("[SIGNALS] screens.count=\(NSScreen.screens.count) main=\(NSScreen.main?.localizedName ?? "nil")")
+
+        for (index, screen) in NSScreen.screens.enumerated() {
+            let insets = screen.safeAreaInsets
+            print("[SIGNALS] #\(index) name=\(screen.localizedName)")
+            print("[SIGNALS] #\(index) frame=\(screen.frame)")
+            print("[SIGNALS] #\(index) visibleFrame=\(screen.visibleFrame)")
+            print(String(
+                format: "[SIGNALS] #\(index) safeAreaInsets top=%.3f left=%.3f bottom=%.3f right=%.3f",
+                insets.top, insets.left, insets.bottom, insets.right
+            ))
+            print("[SIGNALS] #\(index) auxiliaryTopLeftArea=\(rectText(screen.auxiliaryTopLeftArea))")
+            print("[SIGNALS] #\(index) auxiliaryTopRightArea=\(rectText(screen.auxiliaryTopRightArea))")
+            print("[SIGNALS] #\(index) backingScaleFactor=\(screen.backingScaleFactor)")
+            print("[SIGNALS] #\(index) deviceDescription=\(screen.deviceDescription)")
+        }
+    }
+
+    private func rectText(_ rect: NSRect?) -> String {
+        guard let rect else { return "nil" }
+        return "\(rect)"
+    }
+
+    /// 几何探针：把「屏幕宽 − 左右辅助区」当作硬件刘海宽度，按注入参数离屏渲染，
+    /// 叠红色禁画区，并打印三项余量。图与数一起看，不依赖物理屏。
+    @MainActor
+    private func runGeometryProbe(spec: String, outputDirectory: String, label: String) {
+        guard let metrics = HeadlessGeometry.metrics(from: spec) else {
+            print("[GEOMETRY] FAIL 无法解析几何参数：\(spec)")
+            exit(1)
+        }
+        FileShelfRendering.isOffscreen = true
+        let dir = URL(fileURLWithPath: outputDirectory, isDirectory: true)
+        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        // 顶部让位与禁画矩形同源：探针也必须走同一个入口，不能自己另算一份。
+        PageMetrics.configure(topInset: NotchHardware.topInset(for: metrics))
+        NotchHardware.resetCacheCounters()
+
+        let closed = ScreenGeometry.closedSize(for: metrics)
+        // 硬件矩形只从 NotchHardware 取，不再用「闭合宽度 − 4」自己反推。
+        guard let box = NotchHardware.box(for: metrics) else {
+            print("[GEOMETRY] label=\(label) 无刘海（safeAreaTop=0），不设禁画区")
+            exit(0)
+        }
+        let hardware = box.rect.width
+        let centerX = ScreenGeometry.windowSize.width / 2
+        let scale: CGFloat = 3
+        let bandBottom = box.rect.height
+        let topInset = PageMetrics.topInset
+
+        // 以下坐标都以窗口水平中心为原点，向右为正。
+        let chromeHome = -PageMetrics.shapeSize(for: .home).width / 2 + PageMetrics.contentPadding
+        let chromeFiles = -PageMetrics.shapeSize(for: .files).width / 2 + PageMetrics.contentPadding
+        let hardwareLeft = -hardware / 2
+        let hardwareRight = hardware / 2
+
+        // 徽标位置直接读视图真正用的那个值（`closedBadgeTrailing`），
+        // 探针里再写一份公式就会和视图各说各话。
+        let badgeVM = NotchViewModel(
+            closedSize: closed,
+            menuBarHeight: ScreenGeometry.menuBarHeight(for: metrics)
+        )
+        applyFixture(.playing, to: badgeVM)
+        badgeVM.hardwareHalfWidth = NotchHardware.clearanceHalfWidth(for: metrics)
+        let badgeSlotWidth = badgeVM.notchSize.width
+        let badgeLeft = -badgeSlotWidth / 2 + badgeVM.closedBadgeOffset + badgeSlotWidth
+            - badgeVM.closedBadgeTrailing - DesignSystem.Size.closedBadge
+
+        print("[GEOMETRY] label=\(label) spec=\(spec)")
+        print(String(
+            format: "[GEOMETRY] hardware=%.1f estimated=%@ reason=%@ 矩形=%@",
+            hardware, box.isEstimated ? "true" : "false", box.reason ?? "nil",
+            NSStringFromRect(box.rect)
+        ))
+        print(String(
+            format: "[GEOMETRY] 骨架 顶部=%.0f（硬件 %.0f + gap %.0f） chrome=%.0f 间距=%.0f 底部=%.0f 合计=%.0f",
+            topInset, bandBottom, NotchHardware.contentGap,
+            PageMetrics.chromeHeight, PageMetrics.rowSpacing,
+            PageMetrics.contentPadding,
+            topInset + PageMetrics.chromeHeight + PageMetrics.rowSpacing + PageMetrics.contentPadding
+        ))
+        for shelfCount in [0, 1, 2, 3, 4] {
+            let shape = PageMetrics.shapeSize(for: .files, shelfCount: shelfCount)
+            let verdict = PageMetrics.contentShareVerdict(for: .files, shelfCount: shelfCount)
+            print(String(
+                format: "[GEOMETRY] 文件架 %d 条 高=%.0f 内容=%.0f 占比=%.1f%% %@",
+                shelfCount, shape.height, verdict.content, verdict.ratio * 100,
+                verdict.passes ? "OK" : "BELOW_FLOOR"
+            ))
+        }
+        for item in ExpandedItem.allCases where item != .files {
+            let shape = PageMetrics.shapeSize(for: item)
+            let verdict = PageMetrics.contentShareVerdict(for: item)
+            print(String(
+                format: "[GEOMETRY] %@ 高=%.0f 内容=%.0f 占比=%.1f%% %@",
+                item.title, shape.height, verdict.content, verdict.ratio * 100,
+                verdict.passes ? "OK" : "BELOW_FLOOR"
+            ))
+        }
+        print(String(
+            format: "[GEOMETRY] 徽标左缘=%+.1f 硬件右缘=%+.1f 余量=%+.1f %@",
+            badgeLeft, hardwareRight, badgeLeft - hardwareRight,
+            badgeLeft - hardwareRight >= NotchHardware.contentGap - 0.01 ? "OK" : "INTRUDE"
+        ))
+        print(String(
+            format: "[GEOMETRY] 首页 chrome 左缘=%+.1f 水平余量=%+.1f（竖向让位后不再承担避让）",
+            chromeHome, chromeHome - hardwareLeft
+        ))
+        print(String(
+            format: "[GEOMETRY] 文件架 chrome 左缘=%+.1f 水平余量=%+.1f（竖向让位后不再承担避让）",
+            chromeFiles, chromeFiles - hardwareLeft
+        ))
+        print(String(
+            format: "[GEOMETRY] chrome 行顶端=%+.1f 硬件底边=%+.1f 垂直余量=%+.1f %@",
+            topInset, bandBottom, topInset - bandBottom,
+            topInset - bandBottom >= NotchHardware.contentGap - 0.01 ? "OK" : "INTRUDE"
+        ))
+
+        let jobs: [(name: String, open: Bool, route: ExpandedItem, fixture: MediaFixture)] = [
+            ("closed", false, .home, .none),
+            ("closed-playing", false, .home, .playing),
+            ("open-home", true, .home, .playing),
+            ("open-files", true, .files, .none)
+        ]
+        var gateFailures = 0
+        for job in jobs {
+            let vm = NotchViewModel(
+                closedSize: closed,
+                menuBarHeight: ScreenGeometry.menuBarHeight(for: metrics)
+            )
+            vm.select(job.route)
+            applyFixture(job.fixture, to: vm)
+            vm.hardwareHalfWidth = NotchHardware.clearanceHalfWidth(for: metrics)
+            if job.open { vm.open() }
+
+            func canvas(withOverlay: Bool, contentOnly: Bool, withShape: Bool) -> some View {
+                ZStack(alignment: .topLeading) {
+                    // 内容门禁用黑底：黑底与形状同色，禁画区里的亮像素只可能来自内容。
+                    if contentOnly {
+                        Color.black
+                    } else {
+                        Color(red: 0.62, green: 0.64, blue: 0.67)
+                    }
+                    NotchRootView(
+                        vm: vm,
+                        onTap: {},
+                        onSelect: { _ in },
+                        onMediaControl: { _ in },
+                        onOpenPlayerSettings: {},
+                        onDropFiles: { _ in },
+                        onDragOutFile: { _, _ in },
+                        showsShape: withShape
+                    )
+                    .frame(width: ScreenGeometry.windowSize.width, height: ScreenGeometry.windowSize.height)
+                    .offset(x: 40, y: 40)
+                    if withOverlay {
+                        // 硬件禁画区：与内容同坐标系，压在面板之上，越界一眼可见。
+                        Rectangle()
+                            .fill(Color.red.opacity(0.3))
+                            .frame(width: hardware, height: bandBottom)
+                            .offset(x: 40 + centerX - hardware / 2, y: 40)
+                    }
+                }
+                .frame(width: 720, height: 300)
+            }
+
+            /// 扫禁画区里亮度 > 0.2 的像素，命中即报列号。
+            func scan(_ rep: NSBitmapImageRep, border: Int) -> (hits: Int, columns: [Int]) {
+                let px0 = Int(((40 + centerX - hardware / 2) * scale).rounded())
+                let py0 = Int((40 * scale).rounded())
+                let pw = Int((hardware * scale).rounded())
+                let ph = Int((bandBottom * scale).rounded())
+                var hits = 0
+                var columns: [Int] = []
+                for dy in border..<max(border + 1, ph - border) {
+                    for dx in border..<max(border + 1, pw - border) {
+                        let bx = px0 + dx
+                        // NSBitmapImageRep 的 TIFF 数据原点在左上：y 直接向下取，不翻转。
+                        let by = py0 + dy
+                        guard bx >= 0, bx < rep.pixelsWide, by >= 0, by < rep.pixelsHigh,
+                              let color = rep.colorAt(x: bx, y: by) else { continue }
+                        let luminance = 0.299 * color.redComponent
+                            + 0.587 * color.greenComponent
+                            + 0.114 * color.blueComponent
+                        if luminance > 0.2 {
+                            hits += 1
+                            if columns.count < 5 { columns.append(bx) }
+                        }
+                    }
+                }
+                return (hits, columns)
+            }
+
+            // 唯一门禁：只画内容、不画形状，整块禁画区 0 命中（不设任何豁免）。
+            guard let contentRep = renderBitmap(canvas(withOverlay: false, contentOnly: true, withShape: false)) else {
+                print("[GEOMETRY] FAIL 渲染失败：\(job.name)")
+                exit(1)
+            }
+            let gate = scan(contentRep, border: 0)
+            if gate.hits > 0 { gateFailures += 1 }
+            print(String(
+                format: "[GEOMETRY] %@ 内容门禁 命中=%d 列号=%@ %@",
+                job.name, gate.hits,
+                gate.columns.map(String.init).joined(separator: ","),
+                gate.hits == 0 ? "OK" : "INTRUDE"
+            ))
+
+            // 合成图只做诊断：形状本体的抗锯齿会渗到边界内 2pt，
+            // 差异只允许按这一圈解释（豁免仅这 2pt，不扩到整块禁画区）。
+            guard let compositeRep = renderBitmap(canvas(withOverlay: false, contentOnly: false, withShape: true)) else {
+                print("[GEOMETRY] FAIL 渲染失败：\(job.name)")
+                exit(1)
+            }
+            let border = Int((
+                NotchHardware.antialiasOverhang(closedWidth: closed.width, hardwareWidth: hardware) * scale
+            ).rounded())
+            let diagnostic = scan(compositeRep, border: border)
+            print(String(
+                format: "[GEOMETRY] %@ 合成图诊断 豁免 %dpx 后命中=%d 列号=%@",
+                job.name, border, diagnostic.hits,
+                diagnostic.columns.map(String.init).joined(separator: ",")
+            ))
+
+            // 交付图不画形状裁剪：离屏渲染里 `clipShape` 会留下固定的亮边与角部占位色，
+            // 那是 ImageRenderer 的假象、不是屏幕上的样子。形状宽度不变，遮挡判断不受影响。
+            guard let overlayRep = renderBitmap(canvas(withOverlay: true, contentOnly: false, withShape: false)),
+                  let png = overlayRep.representation(using: .png, properties: [:]) else {
+                print("[GEOMETRY] FAIL 渲染失败：\(job.name)")
+                exit(1)
+            }
+            let url = dir.appendingPathComponent("\(label)-\(job.name).png")
+            try? png.write(to: url)
+            print("[GEOMETRY] wrote \(url.path)")
+        }
+
+        // 反向用例：把一块白色方块硬塞进禁画区正中，断言必须变红并报出列号。
+        let negativeCanvas = ZStack(alignment: .topLeading) {
+            Color(red: 0.62, green: 0.64, blue: 0.67)
+            Rectangle()
+                .fill(Color.white)
+                .frame(width: 40, height: 20)
+                .offset(x: 40 + centerX - 20, y: 40 + metrics.safeAreaTop / 2 - 10)
+        }
+        .frame(width: 720, height: 300)
+        if let negative = renderBitmap(negativeCanvas) {
+            let px0 = Int(((40 + centerX - hardware / 2) * scale).rounded())
+            let py0 = Int((40 * scale).rounded())
+            let pw = Int((hardware * scale).rounded())
+            let ph = Int((metrics.safeAreaTop * scale).rounded())
+            var negHits = 0
+            var negColumns: [Int] = []
+            for dy in 0..<ph {
+                for dx in 0..<pw {
+                    let bx = px0 + dx
+                    let by = py0 + dy
+                    guard bx >= 0, bx < negative.pixelsWide, by >= 0, by < negative.pixelsHigh,
+                          let color = negative.colorAt(x: bx, y: by) else { continue }
+                    let luminance = 0.299 * color.redComponent
+                        + 0.587 * color.greenComponent + 0.114 * color.blueComponent
+                    if luminance > 0.2 {
+                        negHits += 1
+                        if negColumns.count < 5 { negColumns.append(bx) }
+                    }
+                }
+            }
+            print(String(
+                format: "[GEOMETRY] 反向用例 命中=%d 列号=%@ %@",
+                negHits, negColumns.map(String.init).joined(separator: ","),
+                negHits > 0 && !negColumns.isEmpty ? "NEGATIVE_OK" : "NEGATIVE_FAIL"
+            ))
+            if negHits == 0 || negColumns.isEmpty { gateFailures += 1 }
+        }
+
+        // 缓存自检：同一配置第二次调用不再计算，配置一变必重算。
+        let before = NotchHardware.computeCount
+        _ = NotchHardware.box(for: metrics)
+        let afterHit = NotchHardware.computeCount
+        var changed = metrics
+        changed.safeAreaTop += 1
+        _ = NotchHardware.box(for: changed)
+        let afterChange = NotchHardware.computeCount
+        let cacheOK = afterHit == before && afterChange == before + 1
+        if !cacheOK { gateFailures += 1 }
+        print(
+            "[GEOMETRY] 缓存 首次后=\(before) 第二次=\(afterHit) 改配置后=\(afterChange) "
+                + (cacheOK ? "CACHE_OK" : "CACHE_FAIL")
+        )
+
+        if gateFailures == 0 {
+            print("[GEOMETRY] PASS 内容门禁 0 命中（@\(Int(scale))x）")
+            exit(0)
+        }
+        print("[GEOMETRY] FAIL 内容门禁/反向用例/缓存 共 \(gateFailures) 项")
+        exit(2)
+    }
+
+    @MainActor
+    private func renderBitmap(_ view: some View) -> NSBitmapImageRep? {
+        let renderer = ImageRenderer(content: view)
+        renderer.scale = 3
+        renderer.isOpaque = true
+        guard let image = renderer.nsImage, let tiff = image.tiffRepresentation else { return nil }
+        return NSBitmapImageRep(data: tiff)
+    }
+
     /// 渲染一张离屏快照（画布 720×300pt，@2x → 1440×600 设备像素，窗口原点固定在 (40,40)pt）。
     ///
     /// `withMarker = false` 时**不画**红色标注线：红线横跨整个窗口宽度、
@@ -991,7 +1936,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         shelfCount: Int = 0,
         screen: NSScreen,
         withMarker: Bool,
-        scale: CGFloat = 2
+        scale: CGFloat = 2,
+        showsShape: Bool = true,
+        canvasBackground: Color? = nil
     ) -> NSBitmapImageRep? {
         let vm = NotchViewModel(
             closedSize: ScreenGeometry.closedSize(for: screen),
@@ -1006,14 +1953,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         // 背景模拟菜单栏；红色 1px 线标记窗口顶边（y = 40）。
         let canvas = ZStack(alignment: .topLeading) {
-            Color(red: 0.62, green: 0.64, blue: 0.67)
+            canvasBackground ?? Color(red: 0.62, green: 0.64, blue: 0.67)
             NotchRootView(
                 vm: vm,
                 onTap: {},
                 onSelect: { _ in },
                 onMediaControl: { _ in },
                 onOpenPlayerSettings: {},
-                onDropFiles: { _ in }
+                onDropFiles: { _ in },
+                onDragOutFile: { _, _ in },
+                showsShape: showsShape
             )
             .frame(width: ScreenGeometry.windowSize.width, height: ScreenGeometry.windowSize.height)
             .offset(x: 40, y: 40)
@@ -1065,6 +2014,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private func renderSnapshots(to directory: String, screen: NSScreen) {
         // `ImageRenderer` 画不了 `ScrollView`：文件架改用同尺寸裁剪容器。
         FileShelfRendering.isOffscreen = true
+        // 设置页列表图标用同一个确定性夹具，保证离屏快照也跨机器可复现。
+        PlayerIconFixture.symbolName = PlayerIconFixture.baselineSymbol
         let dir = URL(fileURLWithPath: directory, isDirectory: true)
         try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
 
@@ -1083,8 +2034,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
         jobs.append(("open-home-denied.png", true, .home, .denied, 0))
         jobs.append(("open-home-empty.png", true, .home, .empty, 0))
+        jobs.append(("open-home-presence.png", true, .home, .presence, 0))
         // 兼容旧命名：open.png = 首页。
         jobs.append(("open.png", true, .home, .playing, 0))
+
+        let enabledPlayers = PlayerRegistry.entries
+            .filter(\.isThirdParty)
+            .filter { PlayerRegistry.isEnabled($0.bundleID) }
+            .count
 
         for job in jobs {
             NSLog("[RENDER] rendering %@", job.name)
@@ -1105,14 +2062,24 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             let closedWidth = ScreenGeometry.closedSize(for: screen).width
                 + (hasBadge ? DesignSystem.Size.closedBadge + DesignSystem.Spacing.sm : 0)
             let size = job.open
-                ? PageMetrics.shapeSize(for: job.route, shelfCount: job.shelf)
+                ? PageMetrics.shapeSize(
+                    for: job.route,
+                    shelfCount: job.shelf,
+                    home: job.fixture.homeLayout,
+                    playersEnabled: job.route == .players ? enabledPlayers : 0
+                  )
                 : CGSize(width: closedWidth, height: ScreenGeometry.closedSize(for: screen).height)
             let url = dir.appendingPathComponent(job.name)
+            let renderedContentHeight = PageMetrics.contentHeight(
+                for: job.route,
+                shelfCount: job.shelf,
+                home: job.fixture.homeLayout,
+                playersEnabled: job.route == .players ? enabledPlayers : 0
+            )
             do {
                 try png.write(to: url)
                 let detail = job.open
-                    ? " content=\(Int(job.route.contentSize.width))x"
-                        + "\(Int(PageMetrics.contentHeight(for: job.route, shelfCount: job.shelf)))"
+                    ? " content=\(Int(job.route.contentSize.width))x\(Int(renderedContentHeight))"
                         + " padding=\(Int(PageMetrics.contentPadding))"
                     : ""
                 print("[RENDER] wrote \(job.name) shape=\(Int(size.width))x\(Int(size.height))\(detail)")
@@ -1582,6 +2549,1675 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         print(failures == 0 ? "[PRESENCE] PASS all \(total) checks" : "[PRESENCE] FAIL \(failures)/\(total)")
         exit(failures == 0 ? 0 : 2)
+    }
+
+    // MARK: - 视觉基线（--render-baseline）
+
+    /// 每条断言的**期望值来源**。来源写不出来的断言不允许存在，也不允许写「当前实现如此」。
+    /// - `aux`：`auxiliaryTopLeftArea` / `auxiliaryTopRightArea` 推出的硬件带宽（本机 179）
+    /// - `safeTop`：`safeAreaInsets.top`（本机 32）
+    /// - `design`：设计常量 + 其外部依据（见 ScreenGeometry / PageMetrics 注释）
+    private enum AssertionSources {
+        static let map: [String: String] = [
+            "state-open": "vm.isOpen（状态事实，不需要渲染期望）",
+            "shape-position": "aux 反推闭合宽 179+4；肩部内缩量 = 当前状态的切点偏移 t（闭合 6 / 展开 19，来源=参照实现）",
+            "inside-center": "形状内本应不透明黑（design 面板底色）",
+            "outside-left": "闭合 a=0：design 阴影不透明度 0；展开 a<250：design 阴影 0.35/radius 4",
+            "outside-right": "同 outside-left",
+            "outside-bottom": "同 outside-left",
+            "corner-left": "耳部在禁画带内，透背景才对；t 取当前状态（闭合 6 / 展开 19，来源=参照实现）",
+            "corner-right": "同 corner-left",
+            "solid-left": "设计常量：肩部内侧 t+2 必须落在实体上（t 取当前状态）",
+            "solid-right": "同 solid-left（带徽标时按本体宽度定位）",
+            "shoulder-boundary": "二次曲线解析解 0.914t；t 取当前状态（闭合 6 / 展开 19，来源=参照实现，绝对值未实测）",
+            "shoulder-arc": "design 抗锯齿过渡带宽度 1...4px（同色 overscan 只遮 1px）",
+            "shoulder-family": "解析内收 t(2√(y/t)−y/t)，容差 0.75pt；两态共用同一条构造，t 按状态取 6/19（同族=构造相同，不是数值相同）",
+            "edge-left": "windowFrame 量化到整设备像素（backingScaleFactor）+ 同色 overscan 1px",
+            "edge-right": "同 edge-left",
+            "edge-bottom": "同 edge-left；展开态阈值 8px 含阴影过渡",
+            "content-not-clipped": "PageMetrics.heightBudget：内容 + chrome + 自有留白 + 系统让位（safeTop−16）",
+            "content-overflow": "同 content-not-clipped，量不裁剪渲染的越界像素",
+            "content-clearance": "内容盒左缘 = x0 + t + contentGap(4)；净间隙下限 = contentGap − 0.5pt，不足即红并打印差值",
+            "closed-top-straight": "NotchHardware.box 的硬件带；本体墙距 = 闭合宽 − 2t（171），未覆盖的 8pt 必须整体落在硬件矩形内",
+            "shelf-peek": "FileShelfLayout：rowHeight 32×3 + rowGap 8×3 + peekHeight 20 = 视口 140",
+            "content-bottom-margin": "底部内边距 16（PageMetrics.contentPadding）+ 至多一档 16 = 32；超过 32 说明内容槽比内容高出一整行（本轮新补，专抓底部纯黑）",
+            "shape-height": "SPEC §7.2 高度表：首页 148/122/120/107、设置页 166/194/222、文件架 124/124/164/204/232、计时器 107、闭合 32；期望值写死，不从实现反推",
+            "height-formula": "SPEC §7.6：H = 92 + C，92 = topInset 36 + chrome 28 + rowSpacing 12 + contentPadding 16；C 只按实际渲染行高求和",
+            "page-coverage": "ExpandedItem.allCases 每页至少一个展开态；新 case 不进基线即红",
+            "text-fit": "真实文案 + TextKit 按页面真实可用宽度排版；限定行数后可容纳字形数 < 全文字形数即为被省略号截断（判据与 SwiftUI 同源）",
+            "fill-face-edges": "SPEC §6.6 / E7：内容盒 23 + 填充面再内缩 4 → 相对形状左缘 27…273、宽 246；像素判据 a=255 且 lum≥8（填充面 10% 白 lum≈26，底色 0），容差 1pt 抗锯齿",
+            "files-e7-stability": "SPEC E7 的理由：不改内缩，0↔1 条切换不得左右跳 4pt；判据=虚线框左缘 vs「首行文字墨迹 − 图标20 − 间距8」复原的行布局左缘，差 ≤1pt（4pt 位移会直接超差），且两者都等于内容盒左缘 x0+23±1.5",
+            "files-top-anchor": "SPEC §7.6 内容盒顶锚 = topInset 36 + chrome 28 + rowSpacing 12 = 76；files-0 虚线框上缘=76，files-1 的 20pt 图标在 32pt 行内居中 → 上缘 82（行带 76…108）",
+            "players-icon-fixture": "基线确定性：设置页列表图标由 PlayerIconFixture 固定为同一占位符号；夹具只改图像内容，不改 16pt 尺寸 / 8pt 间距 / 23 列位置",
+        ]
+    }
+
+    /// 基线清单里的一个状态。
+    private struct BaselineState {
+        let name: String
+        let open: Bool
+        let route: ExpandedItem
+        let fixture: MediaFixture
+        let shelf: Int
+        /// 第三方播放器「已开启」个数，驱动 players 页的子态。
+        let playersEnabled: Int
+        /// 规范 §7.2 声明的高度：高度不许自己从实现反推，必须对表。
+        let specHeight: CGFloat
+        let note: String
+
+        /// 首页版式：夹具 → 版式（与 `HomeLayout.resolve` 同源，闭态不参与）。
+        var homeLayout: HomeLayout { fixture.homeLayout }
+    }
+
+    /// 一页必须覆盖的一个布局子态。
+    private struct BaselineSubState {
+        /// 状态目录名，与 `--render` 的产物命名保持同一套约定（open-home / open-files-2 …）。
+        let name: String
+        let fixture: MediaFixture
+        let shelf: Int
+        let playersEnabled: Int
+        /// 规范 §7.2 的声明高度。新增子态必须同时写死这里，否则无法进清单。
+        let specHeight: CGFloat
+        let note: String
+    }
+
+    /// 基线清单的**唯一来源**：展开态由 `ExpandedItem.allCases` × 本函数派生。
+    ///
+    /// 新增 `ExpandedItem` case 时，下面这个 `switch` 会**编译失败**——这是最强的一道闸：
+    /// 作者必须先声明新页的子态才可能编过。运行时再由 `page-coverage` 断言兜住
+    /// 「声明为空」与「声明了却没进清单」。
+    private func baselineSubStates(for item: ExpandedItem) -> [BaselineSubState] {
+        switch item {
+        case .home:
+            // 首页四种版式高度不同（SPEC §7.2）：播放中 148 / 只有状态 120 / 被拒 120 / 空 107。
+            return [
+                BaselineSubState(name: "open-home", fixture: .playing, shelf: 0,
+                                 playersEnabled: 0, specHeight: 148, note: "首页：播放中"),
+                BaselineSubState(name: "open-home-presence", fixture: .presence, shelf: 0,
+                                 playersEnabled: 0, specHeight: 120, note: "首页：只有播放状态"),
+                BaselineSubState(name: "open-home-empty", fixture: .empty, shelf: 0,
+                                 playersEnabled: 0, specHeight: 107, note: "首页：无播放器"),
+                BaselineSubState(name: "open-home-denied", fixture: .denied, shelf: 0,
+                                 playersEnabled: 0, specHeight: 120, note: "首页：媒体权限被拒"),
+            ]
+        case .files:
+            // 0…4 条各是一个独立布局（行数改变形状高度）；
+            // ≥5 夹紧到 4 条 + 滚动，不产生新布局，故不作为独立态。
+            // 高度对表（SPEC §7.2）：0/1 = 124、2 = 164、3 = 204、4 = 232。
+            let heights: [CGFloat] = [124, 124, 164, 204, 232]
+            return (0...4).map { count in
+                BaselineSubState(name: "open-files-\(count)", fixture: .none, shelf: count,
+                                 playersEnabled: 0, specHeight: heights[count],
+                                 note: "文件架：\(count) 条")
+            }
+        case .timer:
+            return [
+                BaselineSubState(name: "open-timer", fixture: .none, shelf: 0,
+                                 playersEnabled: 0, specHeight: 107, note: "计时器：占位行"),
+            ]
+        case .players:
+            // 0/1/2 个已开启对应三档内容高 74/102/130（SPEC §8.5），是三种不同布局，分别覆盖。
+            // 高度对表：166 / 194 / 222。
+            return [0, 1, 2].map { enabled in
+                BaselineSubState(name: "open-players-\(enabled)", fixture: .none, shelf: 0,
+                                 playersEnabled: enabled,
+                                 specHeight: [166, 194, 222][enabled],
+                                 note: "播放器兼容：第三方已开启 \(enabled) 个")
+            }
+        }
+    }
+
+    /// `--render-baseline[=<dir>]`：固定清单的状态各存一张参考图 + 一份可断言指标。
+    ///
+    /// 参考图取**自身窗口的窗口服务器合成图**（与 `--capture-demo` 同口径，@2x、632×504px）：
+    /// - 不需要屏幕录制权限（只抓自己的窗口），不依赖 `screencapture`，无人工读数；
+    /// - 不走 `ImageRenderer`：本机离屏渲染会在 `clipShape` 的 mask 外区域画出
+    ///   (255,211,0) 黄色占位块（真机窗口没有），会污染凹角与边缘断言。
+    ///
+    /// 判据以 **alpha** 为准：形状外 a=0（透出背景）、形状内 a=255 且为黑；
+    /// 「内容」= a=255 且亮度 > 60。内容是否被裁由两条互补证据给出：
+    /// 1. 合成图里量内容底边到形状底边的余量；
+    /// 2. 另渲染一张**不裁剪**的内容图，量内容自然外接矩形是否越过容器底边。
+    @MainActor
+    private func runBaseline(outputDirectory: String, screen: NSScreen) {
+        guard let controller else {
+            print("[BASELINE] FAIL controller not created")
+            exit(1)
+        }
+        Task { @MainActor in
+            controller.pointerTrackingEnabled = false
+            controller.appActivationCollapseEnabled = false
+            // 首页高度现在随版式变化（148/120/107），真实媒体轮询必须在抓图期间停止：
+            // 否则它异步推来的「当前没在播」会覆盖 .playing 夹具，量到的是空态高度。
+            controller.stopMediaForTesting()
+            // 设置页列表图标换确定性夹具：真实 app 图标取决于本机装了什么，参考图会跨机器漂移。
+            // 夹具只改「画什么图」，16pt 尺寸 / 8pt 间距 / 23 列位置仍由下面这些断言看着。
+            PlayerIconFixture.symbolName = PlayerIconFixture.baselineSymbol
+            let panel = controller.windowForTesting
+            let vm = controller.viewModelForTesting
+            let dir = URL(fileURLWithPath: outputDirectory, isDirectory: true)
+            // 从头重建：先清空输出目录，避免上一轮的残留文件冒充本轮产物。
+            try? FileManager.default.removeItem(at: dir)
+            try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+            let windowSize = ScreenGeometry.windowSize
+
+            var totalChecks = 0
+            var totalFailures = 0
+            var index: [[String: Any]] = []
+            var captures: [String: NSBitmapImageRep] = [:]
+
+            /// 开合/切页动画约 0.4s，等稳定再抓。
+            @MainActor
+            func settle() async {
+                try? await Task.sleep(nanoseconds: 700_000_000)
+            }
+
+            /// 自身窗口的合成图：不需要屏幕录制权限，透明区域保留 alpha。
+            @MainActor
+            func captureWindow() -> NSBitmapImageRep? {
+                guard let image = CGWindowListCreateImage(
+                    .null, .optionIncludingWindow, CGWindowID(panel.windowNumber),
+                    [.boundsIgnoreFraming, .bestResolution]
+                ) else { return nil }
+                return NSBitmapImageRep(cgImage: image)
+            }
+
+            /// 连抓两帧、像素完全一致才算稳定：开合/切页是弹簧动画，固定 sleep 会偶尔抓到中间帧
+            /// （实测抓过形状右移 45pt、被窗口裁掉一截的帧）。最多重试 10 次。
+            /// 还要挡「全透明帧」：窗口尚未重新合成时两帧可能都是空白，连抓一致也会被误采信
+            /// （实测 open-files-4 抓到全透明，7 条断言一起红）。至少有一个不透明像素才算有效帧。
+            @MainActor
+            func hasOpaquePixel(_ rep: NSBitmapImageRep) -> Bool {
+                var y = 0
+                while y < rep.pixelsHigh {
+                    var x = 0
+                    while x < rep.pixelsWide {
+                        if let a = rep.colorAt(x: x, y: y)?.alphaComponent, a > 0.5 { return true }
+                        x += 8
+                    }
+                    y += 8
+                }
+                let probe = rep.colorAt(x: rep.pixelsWide / 2, y: rep.pixelsHigh / 2)
+                print("[BASELINE] DEBUG no-opaque \(rep.pixelsWide)x\(rep.pixelsHigh) "
+                      + "centerAlpha=\(probe?.alphaComponent ?? -1) "
+                      + "visible=\(panel.isVisible) alpha=\(panel.alphaValue) "
+                      + "frame=\(panel.frame) number=\(panel.windowNumber) "
+                      + "vmOpen=\(vm.isOpen) shape=\(vm.notchSize)")
+                return false
+            }
+
+            @MainActor
+            func captureStable() async -> NSBitmapImageRep? {
+                var previous: Data?
+                var latest: NSBitmapImageRep?
+                for _ in 0..<24 {
+                    guard let current = captureWindow(),
+                          let png = current.representation(using: .png, properties: [:]) else { return nil }
+                    guard hasOpaquePixel(current) else {
+                        try? await Task.sleep(nanoseconds: 250_000_000)
+                        continue
+                    }
+                    latest = current
+                    if previous == png { return current }
+                    previous = png
+                    try? await Task.sleep(nanoseconds: 250_000_000)
+                }
+                return latest
+            }
+
+            /// 裁一块并放大（最近邻），用于 6x 特写。只写 PNG，指标由调用方写。
+            @MainActor
+            func writeCloseup(_ rep: NSBitmapImageRep, rectPt: CGRect, scale: CGFloat,
+                              upscale: Int, folder: String, name: String) -> Bool {
+                let rectPx = CGRect(
+                    x: (rectPt.minX * scale).rounded(),
+                    y: (rectPt.minY * scale).rounded(),
+                    width: (rectPt.width * scale).rounded(),
+                    height: (rectPt.height * scale).rounded()
+                )
+                guard let cg = rep.cgImage?.cropping(to: rectPx) else { return false }
+                let w = Int(rectPx.width) * upscale
+                let h = Int(rectPx.height) * upscale
+                guard let ctx = CGContext(
+                    data: nil, width: w, height: h, bitsPerComponent: 8, bytesPerRow: 0,
+                    space: CGColorSpaceCreateDeviceRGB(),
+                    bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
+                ) else { return false }
+                ctx.interpolationQuality = .none
+                ctx.draw(cg, in: CGRect(x: 0, y: 0, width: w, height: h))
+                guard let out = ctx.makeImage() else { return false }
+                let folderURL = dir.appendingPathComponent(folder, isDirectory: true)
+                try? FileManager.default.createDirectory(at: folderURL, withIntermediateDirectories: true)
+                guard let png = NSBitmapImageRep(cgImage: out).representation(using: .png, properties: [:])
+                else { return false }
+                try? png.write(to: folderURL.appendingPathComponent(name))
+                return true
+            }
+
+            @MainActor
+            func writeFolderMetrics(_ folder: String, _ json: [String: Any]) {
+                let folderURL = dir.appendingPathComponent(folder, isDirectory: true)
+                try? FileManager.default.createDirectory(at: folderURL, withIntermediateDirectories: true)
+                if let d = try? JSONSerialization.data(withJSONObject: json, options: [.prettyPrinted, .sortedKeys]) {
+                    try? d.write(to: folderURL.appendingPathComponent("metrics.json"))
+                }
+            }
+
+            /// 单个状态的产物与断言。
+            @MainActor
+            func analyze(_ state: BaselineState) async {
+                let stateDir = dir.appendingPathComponent(state.name, isDirectory: true)
+                try? FileManager.default.createDirectory(at: stateDir, withIntermediateDirectories: true)
+                // 开合状态必须由本函数保证：任何外部关闭都要在这里补回来，否则会抓到闭合帧
+                // （实测被「别的 App 激活 → 收起」拍回闭合，17 条断言全红）。
+                var forcedState = false
+                if state.open != vm.isOpen {
+                    if state.open { vm.open() } else { vm.close() }
+                    forcedState = true
+                    await settle()
+                }
+                let isOpenNow = vm.isOpen
+                let capturedFrame = panel.frame
+                guard let rep = await captureStable() else {
+                    totalChecks += 1
+                    totalFailures += 1
+                    print("[BASELINE] FAIL \(state.name) 窗口合成图抓取失败")
+                    return
+                }
+                captures[state.name] = rep
+                if let png = rep.representation(using: .png, properties: [:]) {
+                    try? png.write(to: stateDir.appendingPathComponent("\(state.name).png"))
+                }
+
+                let scale = CGFloat(rep.pixelsWide) / panel.frame.width
+                let shape = vm.notchSize
+                let x0 = (windowSize.width - shape.width) / 2 + vm.closedBadgeOffset
+                let y0: CGFloat = 0
+                let radius = vm.topTangentOffset
+
+                func pixel(_ pt: CGPoint) -> (r: Int, g: Int, b: Int, a: Int, lum: Double) {
+                    let px = Int((pt.x * scale).rounded())
+                    let py = Int((pt.y * scale).rounded())
+                    guard px >= 0, py >= 0, px < rep.pixelsWide, py < rep.pixelsHigh,
+                          let c = rep.colorAt(x: px, y: py)?.usingColorSpace(.sRGB) else {
+                        return (0, 0, 0, 0, -1)
+                    }
+                    let r = Int((c.redComponent * 255).rounded())
+                    let g = Int((c.greenComponent * 255).rounded())
+                    let b = Int((c.blueComponent * 255).rounded())
+                    let a = Int((c.alphaComponent * 255).rounded())
+                    return (r, g, b, a, 0.299 * Double(r) + 0.587 * Double(g) + 0.114 * Double(b))
+                }
+
+                var checks: [(name: String, pass: Bool, detail: String)] = []
+                var samples: [[String: Any]] = []
+
+                /// expect: `black`（不透明且黑）/ `clear`（完全透明）/ `notOpaque`（不是不透明黑块）
+                func probe(_ name: String, _ pt: CGPoint, expect: String) {
+                    let c = pixel(pt)
+                    let ok: Bool
+                    switch expect {
+                    case "black": ok = c.a == 255 && c.lum < 45
+                    case "clear": ok = c.a <= 2
+                    default: ok = c.a < 250
+                    }
+                    checks.append((name, ok,
+                                   String(format: "rgb=%d,%d,%d a=%d lum=%.0f", c.r, c.g, c.b, c.a, c.lum)))
+                    samples.append([
+                        "name": name,
+                        "x": pt.x,
+                        "y": pt.y,
+                        "expect": expect,
+                        "alpha": c.a,
+                        "rgb": [c.r, c.g, c.b],
+                        "pass": ok
+                    ])
+                }
+
+                /// 一条线上的过渡像素：alpha 既不是全透也不是全不透的像素个数。
+                func transitions(_ from: CGPoint, _ to: CGPoint) -> Int {
+                    let steps = max(1, Int((hypot(to.x - from.x, to.y - from.y) * scale).rounded()))
+                    var count = 0
+                    for i in 0...steps {
+                        let t = CGFloat(i) / CGFloat(steps)
+                        let pt = CGPoint(x: from.x + (to.x - from.x) * t, y: from.y + (to.y - from.y) * t)
+                        let a = pixel(pt).a
+                        if a > 10 && a < 245 { count += 1 }
+                    }
+                    return count
+                }
+
+                let midY = y0 + shape.height / 2
+                let midX = x0 + shape.width / 2
+
+                // 实测不透明外接：中线一行里 alpha 全不透的最左/最右像素。
+                var opaqueLeft = -1.0
+                var opaqueRight = -1.0
+                let midRow = Int((midY * scale).rounded())
+                if midRow >= 0, midRow < rep.pixelsHigh {
+                    for px in 0..<rep.pixelsWide {
+                        guard let c = rep.colorAt(x: px, y: midRow) else { continue }
+                        guard c.alphaComponent > 0.99 else { continue }
+                        let ptX = Double(px) / Double(scale)
+                        if opaqueLeft < 0 { opaqueLeft = ptX }
+                        opaqueRight = ptX
+                    }
+                }
+                // 顶部凹肩：t 是切点偏移（闭合 6 / 展开 19），路径竖直边内缩 t。
+                let expectedBodyLeft = x0 + radius
+                let expectedBodyRight = x0 + shape.width - radius
+                checks.append(("state-open", isOpenNow == state.open,
+                               "vm.isOpen=\(isOpenNow) 期望=\(state.open)"))
+                checks.append((
+                    "shape-position",
+                    abs(opaqueLeft - Double(expectedBodyLeft)) <= 1.5
+                        && abs(opaqueRight - Double(expectedBodyRight)) <= 1.5,
+                    String(format: "实测不透明 %.1f...%.1f 期望 %.1f...%.1f 窗口=%.0f×%.0f",
+                           opaqueLeft, opaqueRight, expectedBodyLeft, expectedBodyRight,
+                           capturedFrame.width, capturedFrame.height)
+                ))
+                // 闭合态：形状外是真正的透明（闭合阴影不透明度为 0）；展开态下方与两侧有阴影，
+                // 所以展开态的「外部」只能断言「没有被不透明黑块盖住」。
+                let outsideExpect = state.open ? "notOpaque" : "clear"
+                probe("inside-center", CGPoint(x: midX, y: midY), expect: "black")
+                probe("outside-left", CGPoint(x: x0 - 3, y: midY), expect: outsideExpect)
+                probe("outside-right", CGPoint(x: x0 + shape.width + 3, y: midY), expect: outsideExpect)
+                probe("outside-bottom", CGPoint(x: midX, y: y0 + shape.height + 3), expect: outsideExpect)
+                // 顶部两侧：两态都是内凹肩，肩外必须透出背景（t 取当前状态：闭合 6 / 展开 19）。
+                let cornerExpect = radius > 0 ? "clear" : "black"
+                probe("corner-left", CGPoint(x: x0 + 1, y: y0 + 1), expect: cornerExpect)
+                probe("corner-right", CGPoint(x: x0 + shape.width - 1, y: y0 + 1), expect: cornerExpect)
+                // 带徽标的闭合态整体加宽、本体左缘不动：实体与右直边采样都必须落在本体上，
+                // 不能落到右侧缩略图上。
+                let bodyWidth = state.open
+                    ? shape.width
+                    : min(shape.width, ScreenGeometry.closedSize(for: screen).width)
+                probe("solid-left", CGPoint(x: x0 + radius + 2, y: y0 + radius + 2), expect: "black")
+                probe("solid-right", CGPoint(x: x0 + bodyWidth - radius - 2, y: y0 + radius + 2),
+                      expect: "black")
+
+                // 展开态两侧有阴影（阴影蒙版在顶部 25% 还完全透明），所以把直边测量点放在肩部以下：
+                // 那里只有抗锯齿、没有阴影，得到的是纯粹的直边过渡像素数。下沿在展开态一定有阴影，
+                // 阈值单独放宽，数值照实记录。
+                // 展开态在肩部以下（y = r + 2）量直边：r>0 后 y0+2 仍在肩弧上，
+                // 会量到内收量而不是竖直边。该高度仍在阴影蒙版排除的前 25% 内。
+                let edgeY = state.open ? y0 + radius + 2 : midY
+                let rightEdgeX = state.open ? x0 + shape.width : x0 + bodyWidth
+                let edgeLimit = state.open ? 2 : 1
+                let bottomLimit = state.open ? 8 : 1
+                let leftEdge = transitions(CGPoint(x: x0 - 3, y: edgeY), CGPoint(x: x0 + 3, y: edgeY))
+                let rightEdge = transitions(CGPoint(x: rightEdgeX - 3, y: edgeY),
+                                            CGPoint(x: rightEdgeX + 3, y: edgeY))
+                let bottomEdge = transitions(CGPoint(x: midX, y: y0 + shape.height - 3),
+                                             CGPoint(x: midX, y: y0 + shape.height + 3))
+                // 顶部肩部（内凹）：在 y = y0 + t/2 这一行水平扫，找第一个不透明黑像素。
+                // 二次曲线在该高度上的解析解是 x0 + 0.914t（t 取当前状态：闭合 6 / 展开 19）。
+                // 方角（t=0）给 +0；外凸圆弧给 +0.134t。两者都离 0.914t 很远，会红。
+                let shoulderY = y0 + radius / 2
+                let expectedShoulder = x0 + 0.914 * radius
+                /// 在某一行从 x0−3 往右扫，返回第一个不透明黑像素的横坐标（pt）。
+                @discardableResult
+                func firstOpaqueX(atY y: Double) -> Double {
+                    let from = Int(((x0 - 3) * scale).rounded())
+                    let to = Int(((x0 + radius + 10) * scale).rounded())
+                    guard to > from else { return -1 }
+                    for px in from...to {
+                        let raw = rep.colorAt(x: px, y: Int((y * scale).rounded()))
+                        guard let c = raw?.usingColorSpace(.sRGB) else { continue }
+                        let lum = 0.299 * Double(c.redComponent * 255)
+                            + 0.587 * Double(c.greenComponent * 255)
+                            + 0.114 * Double(c.blueComponent * 255)
+                        if Double(c.alphaComponent) * 255 >= 250 && lum < 45 {
+                            return Double(px) / Double(scale)
+                        }
+                    }
+                    return -1
+                }
+                let shoulderFirst = firstOpaqueX(atY: shoulderY)
+                let shoulderArc = transitions(
+                    CGPoint(x: x0 - 1, y: shoulderY),
+                    CGPoint(x: x0 + radius + 2, y: shoulderY)
+                )
+                checks.append((
+                    "shoulder-boundary",
+                    shoulderFirst >= 0 && abs(shoulderFirst - Double(expectedShoulder)) <= 1.5,
+                    String(format: "y=%.1f 首个不透明 x=%.1f 期望=%.1f（0.914t，t 取当前状态）",
+                           shoulderY, shoulderFirst, expectedShoulder)
+                ))
+                checks.append((
+                    "shoulder-arc",
+                    shoulderArc >= 1 && shoulderArc <= 4,
+                    "过渡像素=\(shoulderArc)（两态都应 1...4）"
+                ))
+                // 构造证明：肩部轮廓在 y/t = 0.25 / 0.5 / 0.75 处的水平内收量必须落在
+                // 二次曲线解析解 t(2√(y/t) − y/t) 上（容差 0.75pt）。
+                // 方角会在 0.25 处给 0；外凸圆弧在 0.25 处给 0.339t——只有这条内凹构造能同时对上三点。
+                var shoulderFamily: [String] = []
+                var shoulderFamilyOK = true
+                for fraction in [0.25, 0.5, 0.75] {
+                    let y = y0 + radius * fraction
+                    let analyticOffset = radius * (2 * fraction.squareRoot() - fraction)
+                    let measured = firstOpaqueX(atY: y)
+                    let offset = measured >= 0 ? measured - Double(x0) : -1
+                    let ok = abs(offset - analyticOffset) <= 0.75
+                    shoulderFamilyOK = shoulderFamilyOK && ok
+                    shoulderFamily.append(String(
+                        format: "y/r=%.2f 内收 %.2f 解析 %.2f%@",
+                        fraction, offset, analyticOffset, ok ? "" : " FAIL"
+                    ))
+                }
+                checks.append((
+                    "shoulder-family",
+                    shoulderFamilyOK,
+                    shoulderFamily.joined(separator: "；")
+                ))
+
+                checks.append(("edge-left", leftEdge <= edgeLimit,
+                               "过渡像素=\(leftEdge)（阈值 \(edgeLimit)）"))
+                checks.append(("edge-right", rightEdge <= edgeLimit,
+                               "过渡像素=\(rightEdge)（阈值 \(edgeLimit)）"))
+                checks.append(("edge-bottom", bottomEdge <= bottomLimit,
+                               "过渡像素=\(bottomEdge)（阈值 \(bottomLimit)）"))
+
+                // 内容不被裁（合成图）：形状内缩 2pt 扫亮像素，量内容底边到形状底边的余量。
+                let budget = PageMetrics.heightBudget(
+                    for: state.route,
+                    shelfCount: state.shelf,
+                    home: state.homeLayout,
+                    playersEnabled: state.playersEnabled
+                )
+                let naturalShape = budget.total
+                let shapeDelta = naturalShape - shape.height
+                let inset: CGFloat = 2
+                var contentTop = -1.0
+                var contentBottom = -1.0
+                var contentLeft = -1.0
+                var contentRight = -1.0
+                let cx0 = Int(((x0 + inset) * scale).rounded())
+                let cx1 = Int(((x0 + shape.width - inset) * scale).rounded())
+                let cy0 = Int(((y0 + inset) * scale).rounded())
+                let cy1 = Int(((y0 + shape.height - inset) * scale).rounded())
+                if cx1 > cx0, cy1 > cy0 {
+                    for py in cy0...cy1 {
+                        for px in cx0...cx1 {
+                            guard let c = rep.colorAt(x: px, y: py)?.usingColorSpace(.sRGB) else { continue }
+                            guard Double(c.alphaComponent) * 255 >= 250 else { continue }
+                            let lum = 0.299 * Double(c.redComponent * 255)
+                                + 0.587 * Double(c.greenComponent * 255)
+                                + 0.114 * Double(c.blueComponent * 255)
+                            guard lum > 60 else { continue }
+                            let ptX = Double(px) / Double(scale)
+                            let ptY = Double(py) / Double(scale)
+                            if contentTop < 0 || ptY < contentTop { contentTop = ptY }
+                            if ptY > contentBottom { contentBottom = ptY }
+                            if contentLeft < 0 || ptX < contentLeft { contentLeft = ptX }
+                            if ptX > contentRight { contentRight = ptX }
+                        }
+                    }
+                }
+                let bottomMargin = contentBottom < 0 ? -1 : (y0 + shape.height) - contentBottom
+
+                // 内容左侧净间隙：内容最早像素到「侧壁」（x0 + t）的距离，必须 ≥ contentGap(4)。
+                // 展开态内容盒左缘 = x0 + t + 4（t=19 → 23），所以净间隙应 ≈ 4；
+                // 旧实现固定 16 时内容盒左缘 = x0 + 16 < 侧壁 x0 + 19，实测被裁到 x0 + 19。
+                let wallX = Double(x0 + radius)
+                let clearanceFloor = Double(NotchHardware.contentGap)
+                let leftClearance = contentLeft < 0 ? -1 : contentLeft - wallX
+                let clearanceApplicable = state.open || contentLeft >= 0
+                let clearancePass = !clearanceApplicable || leftClearance >= clearanceFloor - 0.5
+                let clearanceDetail: String
+                if !clearanceApplicable {
+                    clearanceDetail = "闭合态无内容像素，不适用"
+                } else if clearancePass {
+                    clearanceDetail = String(
+                        format: "内容左缘=%.1f 侧壁=%.1f 净间隙=%.1fpt（下限 %.1f）",
+                        contentLeft, wallX, leftClearance, clearanceFloor
+                    )
+                } else {
+                    clearanceDetail = String(
+                        format: "内容左缘=%.1f 侧壁=%.1f 净间隙=%.1fpt 差 %.1fpt（下限 %.1f）",
+                        contentLeft, wallX, leftClearance,
+                        clearanceFloor - leftClearance, clearanceFloor
+                    )
+                }
+                checks.append(("content-clearance", clearancePass, clearanceDetail))
+
+                // 闭合态顶部直边：t 在顶边两侧各切掉 t，本体墙距 = 宽 − 2t = 183−12 = 171，
+                // 比硬件带 179 窄 8pt（每侧 4pt）。这 8pt 不被面板覆盖，但必须整体落在硬件矩形内
+                // （物理刘海遮住 → 不可见）。若 t 大于本体相对硬件带的外扩量（当前 2pt），
+                // 透明楔形就会漏到硬件带之外、真的露出桌面背景，这里会红。
+                var hardwareBandInfo: [String: Any] = [:]
+                // 只在「不带徽标」的闭合态量：带徽标时形状整体向右加宽（211），右墙移到
+                // 本体之外，左右不再对称，这条对硬件带的比较没有意义。
+                if !state.open, vm.closedBadgeOffset == 0,
+                   let bandBox = NotchHardware.box(for: ScreenGeometry.Metrics.from(screen)) {
+                    let bodyWidth = Double(min(shape.width, ScreenGeometry.closedSize(for: screen).width))
+                    let hwLeft = Double(bandBox.rect.minX - capturedFrame.minX)
+                    let hwRight = Double(bandBox.rect.maxX - capturedFrame.minX)
+                    let probeY = Double(y0 + radius + 1)
+                    let probeRow = Int((probeY * scale).rounded())
+                    let scanFrom = Int(((x0 - 2) * scale).rounded())
+                    let scanTo = Int(((x0 + bodyWidth + 2) * scale).rounded())
+                    var wallL = -1.0
+                    var wallR = -1.0
+                    if probeRow >= 0, probeRow < rep.pixelsHigh {
+                        let lo = max(0, scanFrom)
+                        let hi = min(rep.pixelsWide - 1, scanTo)
+                        if hi > lo {
+                            for px in lo...hi {
+                                guard let c = rep.colorAt(x: px, y: probeRow),
+                                      c.alphaComponent > 0.99 else { continue }
+                                let pt = Double(px) / Double(scale)
+                                if wallL < 0 { wallL = pt }
+                                wallR = pt
+                            }
+                        }
+                    }
+                    // 顶部 0…t：带内透明像素=透出背景的肩部楔形；带外的那几列是 2pt 抗锯齿外扩。
+                    var clearTop = 0
+                    var clearOutsideBand = 0
+                    let topRows = max(1, Int((radius * scale).rounded()))
+                    let bandFrom = Int((hwLeft * scale).rounded())
+                    let bandTo = Int((hwRight * scale).rounded())
+                    let topLo = max(0, scanFrom)
+                    let topHi = min(rep.pixelsWide - 1, scanTo)
+                    if topHi > topLo {
+                        for py in 0..<min(topRows, rep.pixelsHigh) {
+                            for px in topLo...topHi {
+                                guard let c = rep.colorAt(x: px, y: py),
+                                      c.alphaComponent <= 0.02 else { continue }
+                                clearTop += 1
+                                if px < bandFrom || px > bandTo { clearOutsideBand += 1 }
+                            }
+                        }
+                    }
+                    let straight = wallR - wallL
+                    let bandWidth = hwRight - hwLeft
+                    let leftUncovered = wallL - hwLeft
+                    let rightUncovered = hwRight - wallR
+                    let bandPass = wallL >= hwLeft - 0.5 && wallR <= hwRight + 0.5
+                        && abs(straight - (bodyWidth - 2 * Double(radius))) <= 0.5
+                    checks.append((
+                        "closed-top-straight",
+                        bandPass,
+                        String(format: "本体墙距 %.1fpt（%.0f − 2×%.0f），硬件带 %.1fpt；左右未覆盖 %.1f/%.1fpt 全在硬件矩形内；顶部 0…%.0fpt 透明像素：带内 %d、带外 %d（采样窗外扩 2pt + 本体外扩 2pt）",
+                               straight, bodyWidth, radius, bandWidth,
+                               leftUncovered, rightUncovered, radius,
+                               clearTop - clearOutsideBand, clearOutsideBand)
+                    ))
+                    hardwareBandInfo = [
+                        "straightWallPt": straight,
+                        "bodyWidthPt": bodyWidth,
+                        "hardwareWidthPt": bandWidth,
+                        "wallLeftPt": wallL,
+                        "wallRightPt": wallR,
+                        "hardwareLeftPt": hwLeft,
+                        "hardwareRightPt": hwRight,
+                        "uncoveredLeftPt": leftUncovered,
+                        "uncoveredRightPt": rightUncovered,
+                        "topRowsScanned": topRows,
+                        "clearPixelsInTopBand": clearTop,
+                        "clearPixelsOutsideBand": clearOutsideBand,
+                        "probeYPt": probeY,
+                        "note": "未被面板覆盖的 8pt（每侧 4pt）全在硬件矩形内；抓帧里这些像素 a=0（背景），物理上被刘海遮住"
+                    ]
+                }
+
+                // 展开态的真实余量取自下面那张「不裁剪」渲染：合成图里暗色内容（进度条、
+                // 次级文案）亮度可能低于 60，量到的底边会偏高。/ 闭合态没有页面内容，不做比较。
+                var naturalMargin: Double?
+
+                // 内容不被裁（不裁剪渲染）：内容自然外接矩形是否越过容器底边。
+                var overflowInfo: [String: Any] = [:]
+                if state.open {
+                    FileShelfRendering.isOffscreen = true
+                    let overflowRep = renderCanvas(
+                        open: true, route: state.route, fixture: state.fixture,
+                        shelfCount: state.shelf, screen: screen, withMarker: false,
+                        scale: 2, showsShape: false, canvasBackground: .black
+                    )
+                    FileShelfRendering.isOffscreen = false
+                    if let orep = overflowRep {
+                        if let png = orep.representation(using: .png, properties: [:]) {
+                            try? png.write(to: stateDir.appendingPathComponent("\(state.name)-content.png"))
+                        }
+                        let oscale: CGFloat = 2
+                        let ox0 = 40 + (windowSize.width - shape.width) / 2 + vm.closedBadgeOffset
+                        let oy0: CGFloat = 40
+                        var naturalTop = -1.0
+                        var naturalBottom = -1.0
+                        var naturalLeft = -1.0
+                        var naturalRight = -1.0
+                        var outside = 0
+                        var outsideRows: [Int] = []
+                        let wx0 = Int((40 * oscale).rounded())
+                        let wx1 = Int(((40 + windowSize.width) * oscale).rounded())
+                        let wy0 = Int((oy0 * oscale).rounded())
+                        let wy1 = Int(((40 + windowSize.height) * oscale).rounded())
+                        for py in wy0..<max(wy0, wy1) {
+                            for px in wx0..<max(wx0, wx1) {
+                                guard let c = orep.colorAt(x: px, y: py)?.usingColorSpace(.sRGB) else { continue }
+                                let lum = 0.299 * Double(c.redComponent * 255)
+                                    + 0.587 * Double(c.greenComponent * 255)
+                                    + 0.114 * Double(c.blueComponent * 255)
+                                guard lum > 60 else { continue }
+                                let ptX = Double(px) / Double(oscale)
+                                let ptY = Double(py) / Double(oscale) - Double(oy0)
+                                if naturalTop < 0 || ptY < naturalTop { naturalTop = ptY }
+                                if ptY > naturalBottom { naturalBottom = ptY }
+                                if naturalLeft < 0 || ptX < naturalLeft { naturalLeft = ptX }
+                                if ptX > naturalRight { naturalRight = ptX }
+                                let overBottom = ptY > Double(shape.height) + 0.25
+                                let overSide = ptX < Double(ox0) - 0.25
+                                    || ptX > Double(ox0 + shape.width) + 0.25
+                                if overBottom || overSide {
+                                    outside += 1
+                                    if outsideRows.count < 6 { outsideRows.append(py) }
+                                }
+                            }
+                        }
+                        let unclippedMargin = shape.height - naturalBottom
+                        naturalMargin = unclippedMargin
+                        overflowInfo = [
+                            "naturalTopPt": naturalTop,
+                            "naturalBottomPt": naturalBottom,
+                            "naturalLeftPt": naturalLeft,
+                            "naturalRightPt": naturalRight,
+                            "containerBottomPt": shape.height,
+                            "naturalMarginPt": unclippedMargin,
+                            "outsidePixels": outside,
+                            "outsideRowsPx": outsideRows
+                        ]
+                        let overflowPass = outside == 0
+                        checks.append((
+                            "content-overflow",
+                            overflowPass,
+                            String(format: "越界像素=%d 自然内容底=%.1f 容器底=%.1f 余量=%.1fpt",
+                                   outside, naturalBottom, shape.height, unclippedMargin)
+                        ))
+                        if !overflowPass {
+                            let rows = outsideRows.map { String(format: "%.1f", Double($0) / 2 - 40) }
+                            print("[BASELINE] FAIL \(state.name) content-overflow 被越界元素=\(state.route == .files ? "文件架行" : "页面内容块") 像素行 y=\(rows.joined(separator: ","))pt")
+                        }
+                    } else {
+                        checks.append(("content-overflow", false, "不裁剪渲染失败"))
+                    }
+                }
+
+                // 内容不被裁：展开态的判据 = 自然高度不超容器 + 不裁剪渲染的底边余量 >= 0；
+                // 闭合态没有页面内容，只要求内容底边余量 >= 0。
+                let clipPass: Bool
+                let clipDetail: String
+                if state.open {
+                    let margin = naturalMargin ?? bottomMargin
+                    clipPass = shapeDelta <= 0.01 && margin >= 0
+                    clipDetail = String(
+                        format: "自然=%.1f 容器=%.1f 差=%.1f 不裁剪内容底边余量=%.1fpt",
+                        naturalShape, shape.height, shapeDelta, margin
+                    )
+                } else {
+                    clipPass = contentBottom < 0 || bottomMargin >= 0
+                    clipDetail = contentBottom < 0
+                        ? "闭合态无页面内容，不做自然/容器比较"
+                        : String(format: "闭合态，不做自然/容器比较；内容底边余量=%.1fpt", bottomMargin)
+                }
+                checks.append(("content-not-clipped", clipPass, clipDetail))
+
+                // 底部余量**上限**：内容底到面板底不允许空出超过一个 lg 控件档位。
+                // 口径 = 底部内边距 16（PageMetrics.contentPadding）+ 至多一档 16 → 32。
+                // 超过即意味着内容槽比内容高出一整行——正是设置页 54.5pt 纯黑那类缺陷。
+                // 只判下限的 content-not-clipped 永远抓不到它（这是上一轮真正的漏洞）。
+                let bottomCeiling = DesignSystem.Control.lg
+                let ceilingMargin = state.open ? (naturalMargin ?? bottomMargin) : bottomMargin
+                let ceilingPass = ceilingMargin < 0 || ceilingMargin <= bottomCeiling
+                checks.append((
+                    "content-bottom-margin",
+                    ceilingPass,
+                    ceilingMargin < 0
+                        ? "闭合态无内容像素，不适用"
+                        : String(format: "内容底到面板底=%.1fpt 上限=%.0fpt 超出=%.1fpt",
+                                 ceilingMargin, bottomCeiling,
+                                 max(0, ceilingMargin - bottomCeiling))
+                ))
+
+                // 规范表高度：H 只能取 §7.2 声明的值（148/122/120/107/166/194/222 …）。
+                // 期望值来自规范表，不从实现反推；实现改高度会在这里红。
+                let heightOff = abs(shape.height - state.specHeight)
+                checks.append((
+                    "shape-height",
+                    heightOff <= 0.5,
+                    String(format: "实测 %.0f 规范表 %.0f 差 %.1f", shape.height, state.specHeight, heightOff)
+                ))
+                // H = 92 + C：C 只按实际渲染行高求和（展开态）。闭合态没有页面内容，不适用。
+                if state.open {
+                    let formulaOff = abs(state.specHeight - (PageMetrics.fixedOverhead + budget.content))
+                    checks.append((
+                        "height-formula",
+                        formulaOff <= 0.5,
+                        String(format: "规范表 %.0f = %.0f + C%.0f（实测 %.0f）",
+                               state.specHeight, PageMetrics.fixedOverhead, budget.content, shape.height)
+                    ))
+                }
+
+                // E7 填充面：设置页入口按钮是当前唯一的「整行持久填充面」。
+                // **坐标口径**：下面所有 x 都相对**形状左缘** x0（窗口坐标 8，因为 300 宽形状居中于 316 窗口）。
+                // 规范 §6.6 / E7 的 27…273 就是这个口径：内容盒 23 + 填充面再内缩 4 = 27，右缘 300−27 = 273，
+                // 宽 246。换算成窗口坐标是 35…281。
+                // 量法：取按钮竖直中心那一行（圆角已退出该行，左右是竖直边），
+                // 判据 = alpha 255 且 lum ≥ 8 的最左/最右像素。填充面 10% 白压在纯黑上 lum≈26，
+                // 面板底色 lum=0，所以 8 只可能落在填充面上（抗锯齿半像素也高于它）。
+                // 容差 1pt：@2x 下一个像素是 0.5pt，边缘最多吃掉半个像素。
+                var fillFaceInfo: [String: Any] = [:]
+                if state.route == .players {
+                    checks.append((
+                        "players-icon-fixture",
+                        PlayerIconFixture.symbolName == PlayerIconFixture.baselineSymbol,
+                        "图标来源=\(PlayerIconFixture.symbolName ?? "生产路径（真实 app 图标）")；"
+                            + "夹具固定 16pt，尺寸/列位置与生产一致"
+                    ))
+                    let contentTopPt = PageMetrics.topInset + PageMetrics.chromeHeight
+                        + PageMetrics.rowSpacing
+                    let buttonTop = contentTopPt + budget.content - DesignSystem.Control.md
+                    let probeYPt = buttonTop + DesignSystem.Control.md / 2
+                    let probeRow = Int((probeYPt * scale).rounded())
+                    var fillLeft = -1.0
+                    var fillRight = -1.0
+                    let scanFrom = max(0, Int(((x0 + 1) * scale).rounded()))
+                    let scanTo = min(rep.pixelsWide - 1, Int(((x0 + shape.width - 1) * scale).rounded()))
+                    if probeRow >= 0, probeRow < rep.pixelsHigh, scanTo > scanFrom {
+                        for px in scanFrom...scanTo {
+                            guard let c = rep.colorAt(x: px, y: probeRow)?.usingColorSpace(.sRGB) else { continue }
+                            guard Double(c.alphaComponent) * 255 >= 250 else { continue }
+                            let lum = 0.299 * Double(c.redComponent * 255)
+                                + 0.587 * Double(c.greenComponent * 255)
+                                + 0.114 * Double(c.blueComponent * 255)
+                            guard lum >= 8 else { continue }
+                            let ptX = Double(px) / Double(scale)
+                            if fillLeft < 0 { fillLeft = ptX }
+                            fillRight = ptX
+                        }
+                    }
+                    let leftRel = fillLeft < 0 ? -1 : fillLeft - Double(x0)
+                    let rightRel = fillRight < 0 ? -1 : fillRight - Double(x0)
+                    // 最右像素的中心在 273 内半个像素处，所以宽度用「右缘 − 左缘 + 1px」复原。
+                    let fillWidth = fillLeft < 0 ? -1 : fillRight - fillLeft + 1 / Double(scale)
+                    let tolerance = 1.0
+                    let fillPass = fillLeft >= 0
+                        && abs(leftRel - 27) <= tolerance
+                        && abs(rightRel - 273) <= tolerance
+                    checks.append((
+                        "fill-face-edges",
+                        fillPass,
+                        String(
+                            format: "填充面左缘=%.1f 右缘=%.1f（相对形状左缘；规范 27/273，容差 %.1f）；"
+                                + "窗口坐标 %.1f…%.1f；宽=%.1f（规范 246）；探针行 y=%.1f",
+                            leftRel, rightRel, tolerance, fillLeft, fillRight, fillWidth, probeYPt
+                        )
+                    ))
+                    fillFaceInfo = [
+                        "leftPtRelativeToShape": leftRel,
+                        "rightPtRelativeToShape": rightRel,
+                        "leftPtWindow": fillLeft,
+                        "rightPtWindow": fillRight,
+                        "widthPt": fillWidth,
+                        "probeYPt": probeYPt,
+                        "tolerancePt": tolerance,
+                        "note": "坐标相对形状左缘；窗口坐标 = +8（316 窗口内 300 宽形状居中）"
+                    ]
+                }
+
+                // 文件架：4 条时要有 20pt 提示位（上限被压下去时这里会先掉）。
+                var shelfInfo: [String: Any] = [:]
+                if state.route == .files {
+                    let skeleton = budget.overhead + budget.chrome
+                    let viewport = shape.height - skeleton
+                    let peek = viewport - (FileShelfLayout.rowHeight * 3 + FileShelfLayout.rowGap * 3)
+                    shelfInfo = ["viewportPt": viewport, "peekPt": peek]
+                    if state.shelf >= 4 {
+                        checks.append((
+                            "shelf-peek",
+                            peek >= FileShelfLayout.peekHeight - 0.5,
+                            String(format: "视口=%.1f 提示位=%.1f（应 %.0f）",
+                                   viewport, peek, FileShelfLayout.peekHeight)
+                        ))
+                    }
+                }
+
+                for check in checks {
+                    totalChecks += 1
+                    if !check.pass { totalFailures += 1 }
+                    print("[BASELINE] \(check.pass ? "PASS" : "FAIL") \(state.name) \(check.name)  \(check.detail)")
+                }
+
+                let metrics: [String: Any] = [
+                    "state": state.name,
+                    "note": state.note,
+                    "open": state.open,
+                    "route": String(describing: state.route),
+                    "shelfCount": state.shelf,
+                    "capture": ["width": rep.pixelsWide, "height": rep.pixelsHigh, "scale": scale,
+                                "source": "own-window-composite"],
+                    "panelFrame": ["x": capturedFrame.minX, "y": capturedFrame.minY,
+                                   "width": capturedFrame.width, "height": capturedFrame.height],
+                    "vmIsOpen": isOpenNow,
+                    "forcedState": forcedState,
+                    "measuredOpaque": ["leftPt": opaqueLeft, "rightPt": opaqueRight],
+                    "windowOrigin": ["x": 0, "y": 0, "width": windowSize.width, "height": windowSize.height],
+                    "shape": ["x": x0, "y": y0, "width": shape.width, "height": shape.height],
+                    "corner": ["topTangentOffset": radius, "bottomTangentOffset": vm.bottomTangentOffset,
+                               "semantics": "切点偏移 t，不是 cornerRadius"],
+                    "content": [
+                        "naturalShapeHeight": naturalShape,
+                        "naturalApplicable": state.open,
+                        "containerShapeHeight": shape.height,
+                        "delta": shapeDelta,
+                        "measuredTopPt": contentTop,
+                        "measuredBottomPt": contentBottom,
+                        "measuredLeftPt": contentLeft,
+                        "measuredRightPt": contentRight,
+                        "measuredBottomMarginPt": bottomMargin,
+                        "wallLeftPt": wallX,
+                        "leftClearancePt": leftClearance,
+                        "leftClearanceFloorPt": clearanceFloor,
+                        "leftClearanceApplicable": clearanceApplicable
+                    ],
+                    "hardwareBand": hardwareBandInfo,
+                    "overflow": overflowInfo,
+                    "fillFace": fillFaceInfo,
+                    "shelf": shelfInfo,
+                    "edges": ["leftTransitions": leftEdge, "rightTransitions": rightEdge,
+                              "bottomTransitions": bottomEdge],
+                    "shoulder": ["scanYPt": shoulderY, "firstOpaqueXPt": shoulderFirst,
+                                 "expectedXPt": expectedShoulder,
+                                 "transitions": shoulderArc,
+                                 "family": shoulderFamily,
+                                 "source": "形状来源=auxiliaryTopLeft/RightArea + safeAreaInsets.top 给出的硬件带 179×32；顶部 t 取当前状态（闭合 6 / 展开 19），来源=参照实现，绝对值未实测（见 ScreenGeometry.shoulderTangentOffset）"],
+                    "samples": samples,
+                    "assertionSources": AssertionSources.map,
+                    "checks": checks.map { ["name": $0.name, "pass": $0.pass, "detail": $0.detail] }
+                ]
+                if let data = try? JSONSerialization.data(
+                    withJSONObject: metrics,
+                    options: [.prettyPrinted, .sortedKeys]
+                ) {
+                    try? data.write(to: stateDir.appendingPathComponent("metrics.json"))
+                }
+                index.append(["state": state.name, "path": state.name, "checks": checks.count,
+                              "failures": checks.filter { !$0.pass }.count])
+            }
+
+            // 1) 清单派生：闭合态单独声明（它们不属于任何页面），展开态全部由 allCases 派生。
+            let closedStates = [
+                BaselineState(name: "closed-idle", open: false, route: .home, fixture: .none,
+                              shelf: 0, playersEnabled: 0, specHeight: 32, note: "闭合态，无媒体"),
+                BaselineState(name: "closed-playing", open: false, route: .home, fixture: .playing,
+                              shelf: 0, playersEnabled: 0, specHeight: 32, note: "闭合态，播放中（右侧缩略图位）"),
+                BaselineState(name: "closed-presence", open: false, route: .home, fixture: .presence,
+                              shelf: 0, playersEnabled: 0, specHeight: 32, note: "闭合态，只有播放状态（IOPM 通道）"),
+            ]
+            var states = closedStates
+            for item in ExpandedItem.allCases {
+                for sub in baselineSubStates(for: item) {
+                    states.append(BaselineState(
+                        name: sub.name, open: true, route: item,
+                        fixture: sub.fixture, shelf: sub.shelf,
+                        playersEnabled: sub.playersEnabled, specHeight: sub.specHeight,
+                        note: sub.note
+                    ))
+                }
+            }
+
+            // 2) 派生完备性：allCases 的每一页都必须至少有一个展开态进基线。
+            //    放在抓帧之前——「新增了页面但没进基线」不必等整轮跑完才暴露。
+            for item in ExpandedItem.allCases {
+                totalChecks += 1
+                let covered = states.filter { $0.open && $0.route == item }
+                if covered.isEmpty {
+                    totalFailures += 1
+                    print("[BASELINE] FAIL page-coverage \(item.rawValue) 没有任何展开态进入基线")
+                } else {
+                    print("[BASELINE] PASS page-coverage \(item.rawValue) \(covered.count) 态："
+                          + covered.map(\.name).joined(separator: ", "))
+                }
+            }
+            // 名字重复会让后一个状态覆盖前一个的产物目录，静默丢态。
+            let duplicatedNames = Dictionary(grouping: states, by: \.name)
+                .filter { $0.value.count > 1 }.keys.sorted()
+            totalChecks += 1
+            if duplicatedNames.isEmpty {
+                print("[BASELINE] PASS state-unique \(states.count) 态，名字无重复")
+            } else {
+                totalFailures += 1
+                print("[BASELINE] FAIL state-unique 重复：\(duplicatedNames.joined(separator: ", "))")
+            }
+
+            // 2.5) 文案截断：用**真实字符串**按页面的真实可用宽度做 TextKit 排版。
+            //      判据与 SwiftUI 同源：限定 maximumNumberOfLines 后，能容纳的字形数
+            //      少于全文字形数，尾部就被省略号替换。
+            //      `maxLines` 同时是**文案表声明的档位**：不限行排版的实际行数必须等于它。
+            //      单行档长出两行 = 文字被裁；双行档只有一行 = 底部多 15pt 真空；两个方向都会红。
+            //      这条与「底部余量上限」是两回事，数值分开记：前者量文字宽度/行数，后者量内容底到面板底。
+            func textFit(_ label: String, _ text: String, style: DesignSystem.TextStyle,
+                         width: CGFloat, maxLines: Int) {
+                let nsWeight: NSFont.Weight = style.weight == .semibold ? .semibold : .regular
+                let font = NSFont.systemFont(ofSize: style.size, weight: nsWeight)
+                let attributed = NSAttributedString(string: text, attributes: [.font: font])
+                let storage = NSTextStorage(attributedString: attributed)
+                let layout = NSLayoutManager()
+                let container = NSTextContainer(
+                    size: CGSize(width: width, height: .greatestFiniteMagnitude)
+                )
+                container.lineFragmentPadding = 0
+                container.maximumNumberOfLines = maxLines
+                container.lineBreakMode = .byTruncatingTail
+                layout.addTextContainer(container)
+                storage.addLayoutManager(layout)
+                layout.ensureLayout(for: container)
+                let visible = layout.glyphRange(for: container).length
+                let truncated = visible < layout.numberOfGlyphs
+                // 不限行再排一遍：数自然行数，核对「声明档位 == 实际行数」。
+                let measureStorage = NSTextStorage(attributedString: attributed)
+                let measureLayout = NSLayoutManager()
+                let measureContainer = NSTextContainer(
+                    size: CGSize(width: width, height: .greatestFiniteMagnitude)
+                )
+                measureContainer.lineFragmentPadding = 0
+                measureContainer.maximumNumberOfLines = 0
+                measureLayout.addTextContainer(measureContainer)
+                measureStorage.addLayoutManager(measureLayout)
+                measureLayout.ensureLayout(for: measureContainer)
+                var lineCount = 0
+                var glyph = 0
+                while glyph < measureLayout.numberOfGlyphs {
+                    var lineRange = NSRange()
+                    _ = measureLayout.lineFragmentRect(forGlyphAt: glyph, effectiveRange: &lineRange)
+                    glyph = max(NSMaxRange(lineRange), glyph + 1)
+                    lineCount += 1
+                }
+                let natural = attributed.size()
+                totalChecks += 1
+                if truncated || lineCount != maxLines {
+                    totalFailures += 1
+                    let reason = truncated
+                        ? "会被省略号截断"
+                        : "声明 \(maxLines) 行、实际 \(lineCount) 行"
+                    print(String(format: "[BASELINE] FAIL text-fit %@ %@：需要宽 %.1f 可用 %.1f（；%@）",
+                                 label, reason, natural.width, width, text))
+                } else {
+                    print(String(format: "[BASELINE] PASS text-fit %@ 不截断且行数对上：需要宽 %.1f 可用 %.1f 余 %.1f（声明 %d 行/实际 %d 行；%@）",
+                                 label, natural.width, width, width - natural.width,
+                                 maxLines, lineCount, text))
+                }
+            }
+            let homeTextWidth = ExpandedItem.home.contentSize.width
+            let playersTextWidth = ExpandedItem.players.contentSize.width
+            // 「权限被拒」那行左右各有图标：16 + 8 + 文字 + 8 + 16。
+            let guideTextWidth = homeTextWidth
+                - DesignSystem.Size.icon * 2 - DesignSystem.Spacing.sm * 2
+            // 只有播放状态：图标 16 + 8 + 主文字（右侧提示在 254 宽下整块隐藏）。
+            let presenceTextWidth = homeTextWidth - DesignSystem.Size.icon - DesignSystem.Spacing.sm
+            // 设置页列表：图标 16 + 8 + 名称。
+            let listTextWidth = playersTextWidth - DesignSystem.Size.icon - DesignSystem.Spacing.sm
+            // 设置页按钮：整行填充面再内缩 4（E7）。
+            let buttonTextWidth = playersTextWidth - DesignSystem.Spacing.xs * 2
+            textFit("home-empty", HomeCopyTable.emptyText,
+                    style: DesignSystem.Typography.body, width: homeTextWidth, maxLines: HomeCopyTable.emptyLines)
+            textFit("home-denied", HomeCopyTable.deniedText,
+                    style: DesignSystem.Typography.body, width: guideTextWidth, maxLines: HomeCopyTable.deniedLines)
+            textFit("home-presence", "网易云音乐 · 正在播放",
+                    style: DesignSystem.Typography.body, width: presenceTextWidth, maxLines: 1)
+            textFit("players-system-line", "系统播放器：Music、Spotify（恒开）",
+                    style: DesignSystem.Typography.body, width: playersTextWidth, maxLines: 1)
+            textFit("players-thirdparty-line", "第三方 5/5 已开启 · 默认关闭",
+                    style: DesignSystem.Typography.body, width: playersTextWidth, maxLines: 1)
+            textFit("players-list-name", "YouTube Music",
+                    style: DesignSystem.Typography.body, width: listTextWidth, maxLines: 1)
+            textFit("players-more-line", "另有 4 个已开启",
+                    style: DesignSystem.Typography.body, width: listTextWidth, maxLines: 1)
+            textFit("players-button", "打开播放器设置…",
+                    style: DesignSystem.Typography.body, width: buttonTextWidth, maxLines: 1)
+
+            // 3) 逐个状态跑：每个状态自己重建前置条件，不依赖上一个状态的残留。
+            //    播放器开关是真的 UserDefaults，先存原值、跑完恢复，不留副作用。
+            let originalPlayersEnabled = PlayerRegistry.entries
+                .filter(\.isThirdParty)
+                .map { ($0.bundleID, PlayerRegistry.isEnabled($0.bundleID)) }
+            for state in states {
+                vm.clearShelf()
+                let shelfFiles = makeShelfFixtureFiles(count: state.shelf)
+                if !shelfFiles.isEmpty { vm.addShelfFiles(shelfFiles) }
+                for (index, entry) in PlayerRegistry.entries.filter(\.isThirdParty).enumerated() {
+                    PlayerRegistry.setEnabled(index < state.playersEnabled, for: entry.bundleID)
+                }
+                vm.reloadPlayerSettings()
+                // 先归零再套夹具：`.none` 夹具本身不写状态，不归零会把上一页的媒体带过来。
+                vm.applyMedia(.none, permission: .granted)
+                applyFixture(state.fixture, to: vm)
+                vm.select(state.route)
+                await settle()
+                await analyze(state)
+            }
+
+            // 4) E7 的反例证明（像素）：文件架 0 条 ↔ 1 条切换时，虚线框与首行必须落在同一条左缘上。
+            //    规范给 E7 的理由正是「不改内缩，否则切换时整行左右跳 4pt」；这里把「不跳」钉成断言。
+            //    顺带用两条独立证据确认内容盒顶锚一致：
+            //    files-0 的虚线框上缘就画在内容盒顶 76；files-1 的 20pt 图标在 32pt 行内居中 → 上缘 82（行带 76…108）。
+            do {
+                let filesWidth = PageMetrics.shapeSize(for: .files, shelfCount: 0).width
+                let filesX0 = (windowSize.width - filesWidth) / 2
+                let contentTopPt = PageMetrics.topInset + PageMetrics.chromeHeight
+                    + PageMetrics.rowSpacing
+                // files 0/1 的规范高度都是 124；内容带只取到「面板底 − 底部内边距」，排除底部留白。
+                let filesSpecHeight: CGFloat = 124
+                let bandBottomPt = filesSpecHeight - PageMetrics.contentPadding
+
+                /// 内容带里 x∈[fromX, toX] 的最左墨迹（a=255 且 lum≥8；面板底色 lum=0）。
+                func inkLeft(_ name: String, fromX: Double, toX: Double) -> Double? {
+                    guard let rep = captures[name] else { return nil }
+                    let s = CGFloat(rep.pixelsWide) / panel.frame.width
+                    let yFrom = Int((contentTopPt * s).rounded())
+                    let yTo = Int((bandBottomPt * s).rounded())
+                    let xFrom = max(0, Int((fromX * s).rounded()))
+                    let xTo = min(rep.pixelsWide - 1, Int((toX * s).rounded()))
+                    guard yTo > yFrom, xTo > xFrom else { return nil }
+                    var left = -1.0
+                    for py in yFrom...yTo {
+                        for px in xFrom...xTo {
+                            guard let c = rep.colorAt(x: px, y: py)?.usingColorSpace(.sRGB) else { continue }
+                            guard Double(c.alphaComponent) * 255 >= 250 else { continue }
+                            let lum = 0.299 * Double(c.redComponent * 255)
+                                + 0.587 * Double(c.greenComponent * 255)
+                                + 0.114 * Double(c.blueComponent * 255)
+                            guard lum >= 8 else { continue }
+                            let ptX = Double(px) / Double(s)
+                            if left < 0 || ptX < left { left = ptX }
+                        }
+                    }
+                    return left < 0 ? nil : left
+                }
+
+                /// 在内容带里找最左/最上/最下的墨迹（同上判据）。
+                func inkExtent(_ name: String) -> (left: Double, top: Double, bottom: Double)? {
+                    guard let rep = captures[name] else { return nil }
+                    let s = CGFloat(rep.pixelsWide) / panel.frame.width
+                    let yFrom = Int((contentTopPt * s).rounded())
+                    let yTo = Int((bandBottomPt * s).rounded())
+                    let xFrom = max(0, Int(((filesX0 + 1) * s).rounded()))
+                    let xTo = min(rep.pixelsWide - 1,
+                                  Int(((filesX0 + filesWidth - 1) * s).rounded()))
+                    guard yTo > yFrom, xTo > xFrom else { return nil }
+                    var left = -1.0
+                    var top = -1.0
+                    var bottom = -1.0
+                    for py in yFrom...yTo {
+                        for px in xFrom...xTo {
+                            guard let c = rep.colorAt(x: px, y: py)?.usingColorSpace(.sRGB) else { continue }
+                            guard Double(c.alphaComponent) * 255 >= 250 else { continue }
+                            let lum = 0.299 * Double(c.redComponent * 255)
+                                + 0.587 * Double(c.greenComponent * 255)
+                                + 0.114 * Double(c.blueComponent * 255)
+                            guard lum >= 8 else { continue }
+                            let ptX = Double(px) / Double(s)
+                            let ptY = Double(py) / Double(s)
+                            if left < 0 || ptX < left { left = ptX }
+                            if top < 0 || ptY < top { top = ptY }
+                            if ptY > bottom { bottom = ptY }
+                        }
+                    }
+                    return left < 0 ? nil : (left, top, bottom)
+                }
+
+                let emptyInk = inkExtent("open-files-0")
+                let oneInk = inkExtent("open-files-1")
+                let expectedLeft = Double(filesX0) + Double(PageMetrics.openContentHorizontalInset)
+
+                // files-0 直接量虚线框左缘；files-1 不能直接量首行墨迹——
+                // 20pt 的 app 图标自带透明边（下面 top-anchor 也量到顶部缩 1pt），
+                // 直接比会把「图标内边距」当成布局位移。所以跳过图标列量到**文字**左缘，
+                // 再减去「图标 20 + 间距 8」复原这一行的布局左缘（文字会有 ≤1pt 的字形左边距）。
+                let iconColumn = Double(PageMetrics.openContentHorizontalInset)
+                    + Double(DesignSystem.Size.fileIcon)
+                let dashLeft = inkLeft("open-files-0",
+                                       fromX: Double(filesX0) + 1,
+                                       toX: Double(filesX0 + filesWidth - 1))
+                let textLeft = inkLeft("open-files-1",
+                                       fromX: Double(filesX0) + iconColumn + 4,
+                                       toX: Double(filesX0 + filesWidth - 1))
+                let rowLeft = textLeft.map { $0 - Double(DesignSystem.Size.fileIcon)
+                    - Double(DesignSystem.Spacing.sm) }
+
+                totalChecks += 1
+                if let dashLeft, let rowLeft, let textLeft {
+                    let delta = abs(dashLeft - rowLeft)
+                    let pass = delta <= 1.0
+                        && abs(dashLeft - expectedLeft) <= 1.5
+                        && abs(rowLeft - expectedLeft) <= 1.5
+                    if !pass { totalFailures += 1 }
+                    print(String(
+                        format: "[BASELINE] %@ files-e7-stability 虚线框左缘=%.1f 首行布局左缘=%.1f（文字墨迹 %.1f − 图标20 − 间距8）；差=%.1fpt（要求 0，容差 1.0 含字形左边距）；两态内容盒左缘=%.1f",
+                        pass ? "PASS" : "FAIL", dashLeft, rowLeft, textLeft, delta, expectedLeft
+                    ))
+                } else {
+                    totalFailures += 1
+                    print("[BASELINE] FAIL files-e7-stability 缺少 open-files-0/1 合成图或墨迹")
+                }
+
+                totalChecks += 1
+                if let emptyInk, let oneInk {
+                    let rowIconTop = Double(contentTopPt)
+                        + Double(FileShelfLayout.rowHeight - DesignSystem.Size.fileIcon) / 2
+                    let pass = abs(emptyInk.top - Double(contentTopPt)) <= 1.0
+                        && abs(oneInk.top - rowIconTop) <= 2.5
+                    if !pass { totalFailures += 1 }
+                    print(String(
+                        format: "[BASELINE] %@ files-top-anchor 虚线框上缘=%.1f（应 %.0f）首行图标上缘=%.1f（应 %.0f，20pt 图标居中于 32pt 行）；高度 124/124",
+                        pass ? "PASS" : "FAIL", emptyInk.top, Double(contentTopPt),
+                        oneInk.top, rowIconTop
+                    ))
+                } else {
+                    totalFailures += 1
+                    print("[BASELINE] FAIL files-top-anchor 缺少 open-files-0/1 合成图")
+                }
+            }
+
+            for (bundleID, enabled) in originalPlayersEnabled {
+                PlayerRegistry.setEnabled(enabled, for: bundleID)
+            }
+            vm.reloadPlayerSettings()
+
+            // 特写 1：闭合态顶部左右凹角（从合成图裁切，2x → 最近邻 3 倍 = 有效 6x）
+            if let closedRep = captures["closed-idle"] {
+                let closed = ScreenGeometry.closedSize(for: screen)
+                let cx = (windowSize.width - closed.width) / 2
+                let rect = CGRect(x: cx - 4, y: 0, width: closed.width + 8, height: 16)
+                totalChecks += 1
+                if writeCloseup(closedRep, rectPt: rect, scale: 2, upscale: 3,
+                                folder: "corner-top", name: "corners.png") {
+                    writeFolderMetrics("corner-top", [
+                        "state": "corner-top",
+                        "source": "closed-idle",
+                        "effectiveScale": 6,
+                        "cropPt": ["x": rect.minX, "y": rect.minY,
+                                   "width": rect.width, "height": rect.height],
+                        "note": "闭合态顶部两角；凹角肩内应 alpha=0（透出背景），弧外应为黑"
+                    ])
+                    print("[BASELINE] PASS corner-top corners.png")
+                } else {
+                    totalFailures += 1
+                    print("[BASELINE] FAIL corner-top 裁剪失败")
+                }
+            } else {
+                totalChecks += 1
+                totalFailures += 1
+                print("[BASELINE] FAIL corner-top 缺少 closed-idle 合成图")
+            }
+
+            // 特写 2：展开首页左右直边 + 下沿抗锯齿带
+            let homeEdgeState = "open-home"
+            if let openRep = captures[homeEdgeState] {
+                let home = PageMetrics.shapeSize(for: .home, shelfCount: 0)
+                let ox = (windowSize.width - home.width) / 2
+                let midY = home.height / 2
+                let midX = ox + home.width / 2
+                let leftRect = CGRect(x: ox - 4, y: midY - 6, width: 8, height: 12)
+                let rightRect = CGRect(x: ox + home.width - 4, y: midY - 6, width: 8, height: 12)
+                let bottomRect = CGRect(x: midX - 6, y: home.height - 4, width: 12, height: 8)
+                var wrote = 0
+                if writeCloseup(openRep, rectPt: leftRect, scale: 2, upscale: 3,
+                                folder: "edges", name: "left.png") { wrote += 1 }
+                if writeCloseup(openRep, rectPt: rightRect, scale: 2, upscale: 3,
+                                folder: "edges", name: "right.png") { wrote += 1 }
+                if writeCloseup(openRep, rectPt: bottomRect, scale: 2, upscale: 3,
+                                folder: "edges", name: "bottom.png") { wrote += 1 }
+                totalChecks += 1
+                if wrote == 3 {
+                    writeFolderMetrics("edges", [
+                        "state": "edges",
+                        "source": homeEdgeState,
+                        "effectiveScale": 6,
+                        "cropsPt": [
+                            "left": ["x": leftRect.minX, "y": leftRect.minY,
+                                     "width": leftRect.width, "height": leftRect.height],
+                            "right": ["x": rightRect.minX, "y": rightRect.minY,
+                                      "width": rightRect.width, "height": rightRect.height],
+                            "bottom": ["x": bottomRect.minX, "y": bottomRect.minY,
+                                       "width": bottomRect.width, "height": bottomRect.height]
+                        ],
+                        "note": "展开首页直边/下沿；2x 裁切后最近邻放大 3 倍"
+                    ])
+                    print("[BASELINE] PASS edges left/right/bottom.png")
+                } else {
+                    totalFailures += 1
+                    print("[BASELINE] FAIL edges 裁剪 \(wrote)/3")
+                }
+            } else {
+                totalChecks += 1
+                totalFailures += 1
+                print("[BASELINE] FAIL edges 缺少 open-home 合成图")
+            }
+
+            // 顶部肩部对照（证据，不参与产品形状）：产品两态用同一条 NotchShape，只改切点偏移 t。
+            // 另加一条**外凸圆弧**对照（RoundedRectangle 同一 t=19），用来验证判据本身有分辨力：
+            // 内凹构造在 y=t/2 的首个不透明像素 = 0.914t；外凸圆弧 = 0.134t；方角 = 0。
+            do {
+                let folder = "corner-variants"
+                let folderURL = dir.appendingPathComponent(folder, isDirectory: true)
+                try? FileManager.default.createDirectory(at: folderURL, withIntermediateDirectories: true)
+                enum ShoulderKind: String {
+                    case notchTangent
+                    case convexArc
+                }
+                struct Variant {
+                    let name: String
+                    let topOffset: CGFloat
+                    let bottomOffset: CGFloat
+                    let width: CGFloat
+                    let height: CGFloat
+                    let kind: ShoulderKind
+                    let note: String
+                    /// y=t/2 行的首个不透明像素相对 x0 的偏移：内凹解析解 0.914t；外凸圆弧 0.134t。
+                    var expectedOffset: Double {
+                        switch kind {
+                        case .notchTangent: return 0.914 * Double(topOffset)
+                        case .convexArc: return Double(topOffset) * (1 - (3.0 / 4.0).squareRoot())
+                        }
+                    }
+                }
+                let variants = [
+                    Variant(name: "closed-t6", topOffset: 6, bottomOffset: 14, width: 183, height: 32,
+                            kind: .notchTangent,
+                            note: "闭合态：切点偏移 t=6（参照值，绝对值未实测）"),
+                    Variant(name: "open-t19-spec", topOffset: 19, bottomOffset: 24, width: 300, height: 148,
+                            kind: .notchTangent,
+                            note: "展开态规格：同一条构造、t=19（参照值，绝对值未实测）"),
+                    Variant(name: "open-t0-retired", topOffset: 0, bottomOffset: 24, width: 300, height: 148,
+                            kind: .notchTangent,
+                            note: "作废规格：展开方角（耳部会被涂黑）"),
+                    Variant(name: "convex-t19", topOffset: 19, bottomOffset: 24, width: 300, height: 148,
+                            kind: .convexArc,
+                            note: "外凸对照：把 19 喂进圆角通道（RoundedRectangle），首黑应 ≈2.5 而非 17.4")
+                ]
+                var reports: [[String: Any]] = []
+                var discriminative = true
+                var rendered: [String: NSBitmapImageRep] = [:]
+                for variant in variants {
+                    let canvas = ZStack(alignment: .topLeading) {
+                        Color(red: 0.62, green: 0.64, blue: 0.67)
+                        Group {
+                            switch variant.kind {
+                            case .notchTangent:
+                                NotchShape(topTangentOffset: variant.topOffset,
+                                           bottomTangentOffset: variant.bottomOffset)
+                                    .fill(DesignSystem.Colors.surface)
+                            case .convexArc:
+                                RoundedRectangle(cornerRadius: variant.topOffset, style: .circular)
+                                    .fill(DesignSystem.Colors.surface)
+                            }
+                        }
+                        .frame(width: variant.width, height: variant.height)
+                        .offset(x: 40, y: 40)
+                    }
+                    .frame(width: 360, height: 260)
+                    let renderer = ImageRenderer(content: canvas)
+                    renderer.scale = 2
+                    guard let image = renderer.nsImage, let tiff = image.tiffRepresentation,
+                          let rep = NSBitmapImageRep(data: tiff) else { continue }
+                    if let png = rep.representation(using: .png, properties: [:]) {
+                        try? png.write(to: folderURL.appendingPathComponent("\(variant.name).png"))
+                    }
+                    rendered[variant.name] = rep
+                    func sampleRGBA(_ pt: CGPoint) -> [Int] {
+                        guard let raw = rep.colorAt(x: Int((pt.x * 2).rounded()),
+                                                    y: Int((pt.y * 2).rounded())),
+                              let c = raw.usingColorSpace(.sRGB) else { return [-1, -1, -1, -1] }
+                        return [Int((c.redComponent * 255).rounded()),
+                                Int((c.greenComponent * 255).rounded()),
+                                Int((c.blueComponent * 255).rounded()),
+                                Int((c.alphaComponent * 255).rounded())]
+                    }
+                    let x0: CGFloat = 40
+                    let y0: CGFloat = 40
+                    let earLeft = sampleRGBA(CGPoint(x: x0 + 1, y: y0 + 1))
+                    let earRight = sampleRGBA(CGPoint(x: x0 + variant.width - 1, y: y0 + 1))
+                    let solidLeft = sampleRGBA(
+                        CGPoint(x: x0 + variant.topOffset + 2, y: y0 + variant.topOffset + 2))
+                    let scanY = y0 + (variant.topOffset > 0 ? variant.topOffset / 2 : 2)
+                    var firstOffset: Double = -1
+                    var scanX = Int(((x0 - 3) * 2).rounded())
+                    let scanEnd = Int(((x0 + variant.topOffset + 10) * 2).rounded())
+                    while scanX <= scanEnd {
+                        if let raw = rep.colorAt(x: scanX, y: Int((scanY * 2).rounded())),
+                           let c = raw.usingColorSpace(.sRGB) {
+                            let rr = Double(c.redComponent)
+                            let gg = Double(c.greenComponent)
+                            let bb = Double(c.blueComponent)
+                            let lum = 0.299 * rr + 0.587 * gg + 0.114 * bb
+                            if lum < 0.18 {
+                                firstOffset = Double(scanX) / 2 - Double(x0)
+                                break
+                            }
+                        }
+                        scanX += 1
+                    }
+                    let earIsBackground = earLeft[0] > 120
+                    // 分辨力自检：产品两态与外凸对照的耳部都应是背景；
+                    // 作废的方角必须把耳部涂黑；每条形状的首黑偏移都必须落在自己的解析解上。
+                    if variant.name == "open-t0-retired" {
+                        if earIsBackground { discriminative = false }
+                    } else if !earIsBackground {
+                        discriminative = false
+                    }
+                    if abs(firstOffset - variant.expectedOffset) > 1.0 { discriminative = false }
+                    reports.append([
+                        "name": variant.name,
+                        "kind": variant.kind.rawValue,
+                        "topOffset": variant.topOffset,
+                        "width": variant.width,
+                        "height": variant.height,
+                        "note": variant.note,
+                        "earLeftRGBA": earLeft,
+                        "earRightRGBA": earRight,
+                        "solidLeftRGBA": solidLeft,
+                        "shoulderScanYPt": scanY,
+                        "firstOpaqueOffsetPt": firstOffset,
+                        "expectedOffsetPt": variant.expectedOffset
+                    ])
+                    print("[BASELINE] corner-variants \(variant.name) ear-left=\(earLeft) "
+                          + "solid-left=\(solidLeft) 首黑 +\(String(format: "%.2f", firstOffset))pt"
+                          + " 期望 +\(String(format: "%.2f", variant.expectedOffset))pt")
+                }
+                // 同族叠合：两态**数值不同**（闭合 t=6 / 展开 t=19），所以不能比像素重合，
+                // 要比「按各自 t 归一化后的轮廓」。归一化坐标 v=y/t、u=(x−x0)/t：
+                // 同一条 quad 构造在归一化后必须落在同一条曲线上；异族会分叉。
+                var overlayReport: [String: Any] = ["written": false]
+                var sameFamily = false
+                var overlayHasPixels = false
+                // 左边裁剪：闭合只占 6pt，展开占 19pt，两态给不同尺寸，各自看完整个肩部。
+                let closedCrop = (w: 32, h: 20, ox: Int(40 * 2) - 8, oy: Int(40 * 2) - 4)   // 16×10pt
+                let openCrop = (w: 56, h: 48, ox: Int(40 * 2) - 8, oy: Int(40 * 2) - 4)     // 28×24pt
+                let closedTop = Double(ScreenGeometry.cornerRadiusInsets.closed.top)
+                let openTop = Double(ScreenGeometry.cornerRadiusInsets.opened.top)
+                if let cRep = rendered["closed-t6"], let oRep = rendered["open-t19-spec"] {
+                    /// 归一化边界：在 v=y/t 处找左肩首个不透明黑像素，返回 u=(x−x0)/t
+                    /// 以及**量化后**的实际 v（y 取整到设备像素后反算，供解析残差使用）。
+                    func normalizedBoundary(
+                        _ rep: NSBitmapImageRep, top: Double, v: Double
+                    ) -> (u: Double, v: Double)? {
+                        let yPt = 40 + v * top
+                        let y = Int((yPt * 2).rounded())
+                        let scanStart: CGFloat = 40 - 2
+                        var px = Int((scanStart * 2).rounded())
+                        let end = Int(((40 + top + 2) * 2).rounded())
+                        while px <= end {
+                            if let c = rep.colorAt(x: px, y: y)?.usingColorSpace(.sRGB) {
+                                let rr: Double = Double(c.redComponent)
+                                let gg: Double = Double(c.greenComponent)
+                                let bb: Double = Double(c.blueComponent)
+                                let lum: Double = 0.299 * rr + 0.587 * gg + 0.114 * bb
+                                if c.alphaComponent > 0.7 && lum < 0.25 {
+                                    // 一个设备像素高 0.5pt；首个变黑意味着该行已有约 3/4 被覆盖，
+                                    // 对应的曲线高度约为行顶 +0.375pt（不是行顶 0，也不是行底 0.5）。
+                                    let vActual = (Double(y) / 2 + 0.375 - 40) / top
+                                    return ((Double(px) / 2 - 40) / top, vActual)
+                                }
+                            }
+                            px += 1
+                        }
+                        return nil
+                    }
+                    let rows = 96
+                    var maxResidual = 0.0
+                    var profile: [[Double]] = []
+                    var uC = [Double](repeating: -1, count: rows)
+                    var uO = [Double](repeating: -1, count: rows)
+                    for row in 0..<rows {
+                        let v = (Double(row) + 0.5) / Double(rows)
+                        guard let a = normalizedBoundary(cRep, top: closedTop, v: v),
+                              let b = normalizedBoundary(oRep, top: openTop, v: v) else { continue }
+                        uC[row] = a.u; uO[row] = b.u
+                        // 判据：两态各自对解析解 u(v)=2√v−v 的残差。
+                        // 不能直接比 u(闭合)−u(展开)：v→0 处 du/dv=1/√v−1→∞，
+                        // 闭合 t=6 只有 6pt 覆盖整个肩部，1px 的 y 量化会被放大成 ≈0.08u，
+                        // 展开 t=19 只有 ≈0.03u——差值是采样栅格，不是形状。
+                        let analyticC = 2 * a.v.squareRoot() - a.v
+                        let analyticO = 2 * b.v.squareRoot() - b.v
+                        maxResidual = max(maxResidual, abs(a.u - analyticC), abs(b.u - analyticO))
+                        profile.append([v, a.u, b.u, abs(a.u - b.u)])
+                    }
+                    // 归一化轮廓图：红=闭合，青=展开，两者落在同一像素即白（同族）。
+                    let plotW = rows, plotH = rows
+                    var plot = [UInt8](repeating: 0, count: plotW * plotH * 4)
+                    for i in 0..<(plotW * plotH) {
+                        plot[i * 4] = 24; plot[i * 4 + 1] = 24; plot[i * 4 + 2] = 24; plot[i * 4 + 3] = 255
+                    }
+                    for row in 0..<rows {
+                        let prow = rows - 1 - row
+                        for (u, isClosed) in [(uC[row], true), (uO[row], false)] where u >= 0 {
+                            let col = min(max(Int((u * Double(plotW)).rounded()), 0), plotW - 1)
+                            let o = (prow * plotW + col) * 4
+                            let wasClosed = plot[o] == 220
+                            let wasOpen = plot[o] == 60 && plot[o + 2] == 220
+                            if wasClosed || wasOpen {
+                                plot[o] = 255; plot[o + 1] = 255; plot[o + 2] = 255
+                            } else if isClosed {
+                                plot[o] = 220; plot[o + 1] = 60; plot[o + 2] = 60
+                            } else {
+                                plot[o] = 60; plot[o + 1] = 200; plot[o + 2] = 220
+                            }
+                        }
+                    }
+                    let plotZoom = 4
+                    var up = [UInt8](repeating: 0, count: plotW * plotZoom * plotH * plotZoom * 4)
+                    let upW = plotW * plotZoom
+                    for ur in 0..<(plotH * plotZoom) {
+                        let sr = ur / plotZoom
+                        for uc in 0..<upW {
+                            let s = (sr * plotW + uc / plotZoom) * 4
+                            let d = (ur * upW + uc) * 4
+                            up[d] = plot[s]; up[d + 1] = plot[s + 1]
+                            up[d + 2] = plot[s + 2]; up[d + 3] = plot[s + 3]
+                        }
+                    }
+                    /// 逐像素裁剪（每态自己的 t，不归一化），便于直接看形状。
+                    func crop(_ rep: NSBitmapImageRep, _ box: (w: Int, h: Int, ox: Int, oy: Int),
+                              _ name: String) -> Bool {
+                        var buf = [UInt8](repeating: 0, count: box.w * box.h * 4)
+                        for row in 0..<box.h {
+                            for col in 0..<box.w {
+                                guard let c = rep.colorAt(x: box.ox + col, y: box.oy + row)?
+                                    .usingColorSpace(.sRGB) else { continue }
+                                let a = Double(c.alphaComponent)
+                                let dst = (row * box.w + col) * 4
+                                buf[dst] = rgbaByte(Double(c.redComponent) * a)
+                                buf[dst + 1] = rgbaByte(Double(c.greenComponent) * a)
+                                buf[dst + 2] = rgbaByte(Double(c.blueComponent) * a)
+                                buf[dst + 3] = rgbaByte(a)
+                            }
+                        }
+                        return writeRGBAImage(buf, width: box.w, height: box.h,
+                                              to: folderURL.appendingPathComponent(name))
+                    }
+                    let wroteClosed = crop(cRep, closedCrop, "shoulder-closed.png")
+                    let wroteOpen = crop(oRep, openCrop, "shoulder-open-t19.png")
+                    let wrotePlot = writeRGBAImage(up, width: upW, height: upW,
+                                                   to: folderURL.appendingPathComponent("shoulder-overlay-normalized.png"))
+                    // 容差按归一化单位给 0.12：闭合 t=6 时 1 个设备像素就是 0.083u，
+                    // 再严就测到采样精度而不是形状本身了。
+                    sameFamily = maxResidual <= 0.12 && profile.count >= rows / 2
+                    let white = stride(from: 0, to: plot.count, by: 4).reduce(0) {
+                        $0 + (plot[$1] == 255 ? 1 : 0)
+                    }
+                    overlayHasPixels = wrotePlot && white > 0
+                    overlayReport = [
+                        "written": wrotePlot,
+                        "file": wrotePlot ? "shoulder-overlay-normalized.png" : NSNull(),
+                        "closedFile": wroteClosed ? "shoulder-closed.png" : NSNull(),
+                        "openFile": wroteOpen ? "shoulder-open-t19.png" : NSNull(),
+                        "closedTopPt": closedTop,
+                        "openTopPt": openTop,
+                        "normalized": "u=(x−x0)/t, v=(y−y0)/t；红=闭合 青=展开 白=重合；判定用「各自对 u(v)=2√v−v 的残差」，不用红青逐行差",
+                        "whitePixelCount": white,
+                        "maxNormalizedResidual": maxResidual,
+                        "profileRows": profile
+                    ]
+                }
+                writeFolderMetrics(folder, [
+                    "analytic": "顶部肩为二次曲线：u(v)=2√v−v（v=y/t），y=t/2 处 u=0.914；t=0 退化为直边；外凸圆弧在 y=t/2 处 u=0.134",
+                    "variants": reports,
+                    "overlay": overlayReport
+                ])
+                totalChecks += 1
+                if discriminative {
+                    print("[BASELINE] PASS corner-variants 探针能区分内凹肩 / 方角 / 外凸圆弧")
+                } else {
+                    totalFailures += 1
+                    print("[BASELINE] FAIL corner-variants 探针失去分辨力")
+                }
+                totalChecks += 1
+                if sameFamily {
+                    let residual = (overlayReport["maxNormalizedResidual"] as? Double) ?? -1
+                    print(String(format: "[BASELINE] PASS shoulder-overlay 两态都贴合解析轮廓（最大残差 %.3fu）", residual))
+                } else {
+                    totalFailures += 1
+                    print("[BASELINE] FAIL shoulder-overlay 闭合与展开肩部不同族")
+                }
+                // 图形证据自身也要能真红：空的 PNG 曾经被当成「叠合通过」的证据。
+                totalChecks += 1
+                if overlayHasPixels {
+                    let white = (overlayReport["whitePixelCount"] as? Int) ?? 0
+                    let rows = (overlayReport["profileRows"] as? [[Double]])?.count ?? 0
+                    print("[BASELINE] PASS shoulder-overlay-evidence 归一化轮廓图含 \(white) 个重合白像素（\(rows) 行采样）")
+                } else {
+                    totalFailures += 1
+                    print("[BASELINE] FAIL shoulder-overlay-evidence 叠合图未写出、全透明或两态无重合")
+                }
+            }
+
+            let summary: [String: Any] = [
+                "generatedAt": ISO8601DateFormatter().string(from: Date()),
+                "capture": "own-window-composite @2x",
+                "states": index,
+                "checks": totalChecks,
+                "failures": totalFailures
+            ]
+            if let d = try? JSONSerialization.data(withJSONObject: summary, options: [.prettyPrinted, .sortedKeys]) {
+                try? d.write(to: dir.appendingPathComponent("index.json"))
+            }
+            print("[BASELINE] \(totalFailures == 0 ? "PASS" : "FAIL") \(totalChecks) checks, \(totalFailures) failed -> \(dir.path)")
+            exit(totalFailures == 0 ? 0 : 2)
+        }
+    }
+
+    // MARK: - 窗口截图演示：自己窗口的合成图 + 纯视图层对照
+
+    /// `--capture-demo=<dir>`：不依赖屏幕录制权限（TCC 对 `screencapture` 是拒绝的），
+    /// 直接让 app 抓**自己窗口**的窗口服务器合成图，再补一张纯视图层快照做对照。
+    ///
+    /// 三组状态各抓一次：指针在面板外（闭合）/ 指针在面板内（已展开）/ 指针移出后（闭合）。
+    /// 视图层快照与窗口合成图的差异，就是「系统画的」与「我们画的」的分界。
+    @MainActor
+    private func runCaptureDemo(outputDirectory: String) {
+        guard let controller else {
+            print("[CAPTURE] FAIL: controller not created")
+            exit(1)
+        }
+        // 程序化驱动 hover，避免依赖辅助功能权限去投递鼠标事件；
+        // 走的是和真实 hover 完全相同的入口 `handlePointer(inside:)`。
+        controller.pointerTrackingEnabled = false
+        let dir = URL(fileURLWithPath: outputDirectory, isDirectory: true)
+        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        let panel = controller.windowForTesting
+
+        func write(_ name: String, _ rep: NSBitmapImageRep, note: String) {
+            guard let png = rep.representation(using: .png, properties: [:]) else {
+                print("[CAPTURE] FAIL \(name) png encode")
+                return
+            }
+            try? png.write(to: dir.appendingPathComponent("\(name).png"))
+            print("[CAPTURE] wrote \(name).png px=\(rep.pixelsWide)x\(rep.pixelsHigh)"
+                  + " points=\(Int(panel.frame.width))x\(Int(panel.frame.height))"
+                  + " scale=\(panel.backingScaleFactor) \(note)")
+        }
+
+        /// 窗口服务器合成图：包含系统为窗口画的东西（边框/样式），是「看得见的现象」。
+        /// `framed == true` 时不传 `.boundsIgnoreFraming`，窗口框与阴影一并入图——
+        /// 白边如果画在「框」上，只有这一张能看到。
+        func captureWindow(_ name: String, framed: Bool = false) {
+            let options: CGWindowImageOption = framed
+                ? [.bestResolution]
+                : [.boundsIgnoreFraming, .bestResolution]
+            guard let image = CGWindowListCreateImage(
+                .null, .optionIncludingWindow, CGWindowID(panel.windowNumber), options
+            ) else {
+                print("[CAPTURE] FAIL \(name): CGWindowListCreateImage nil")
+                return
+            }
+            write(name, NSBitmapImageRep(cgImage: image),
+                  note: framed ? "window-composited+framed" : "window-composited")
+            // 尺寸对账：点 × backingScaleFactor 必须等于像素，否则说明这张图被裁过，
+            // 边界判定无效。只有 `.boundsIgnoreFraming` 那一张应当 match=true。
+            let scale = panel.backingScaleFactor
+            let expected = (
+                Int((panel.frame.width * scale).rounded()),
+                Int((panel.frame.height * scale).rounded())
+            )
+            print("[CAPTURE] bounds-check \(name) imagePx=\(image.width)x\(image.height)"
+                  + " windowPt=\(Int(panel.frame.width))x\(Int(panel.frame.height))"
+                  + " scale=\(scale) expectedPx=\(expected.0)x\(expected.1)"
+                  + " match=\(image.width == expected.0 && image.height == expected.1)")
+        }
+
+        /// 纯视图层快照：只有 AppKit/SwiftUI 自己画的内容，系统边框不会出现。
+        func captureView(_ name: String) {
+            guard let view = panel.contentView, view.bounds.width > 0,
+                  let rep = view.bitmapImageRepForCachingDisplay(in: view.bounds) else {
+                print("[CAPTURE] FAIL \(name): view snapshot unavailable")
+                return
+            }
+            view.cacheDisplay(in: view.bounds, to: rep)
+            write(name, rep, note: "view-only")
+        }
+
+        Task { @MainActor in
+            try? await Task.sleep(nanoseconds: 1_500_000_000)
+            captureWindow("01-closed-pointer-outside")
+            captureWindow("01b-closed-framed", framed: true)
+            captureView("01v-closed-view-only")
+
+            // 真把光标挪进面板：程序化 `handlePointer` 只覆盖 App 自己的状态，
+            // 系统是否按「光标悬停在窗口上」画装饰，只有真光标在窗口里才成立。
+            let screenHeight = NSScreen.main?.frame.height ?? 0
+            let origin = CGPoint(
+                x: panel.frame.midX,
+                y: screenHeight - (panel.frame.maxY - 16)
+            )
+            CGWarpMouseCursorPosition(origin)
+            controller.handlePointer(inside: true)
+            try? await Task.sleep(nanoseconds: 2_000_000_000)
+            captureWindow("02-open-pointer-inside")
+            captureWindow("02b-open-framed", framed: true)
+            captureView("02v-open-view-only")
+
+            // 焦点：能不能成为 key，是「焦点环」假设成立与否的前提。
+            print("[FOCUS] canBecomeKey=\(panel.canBecomeKey) canBecomeMain=\(panel.canBecomeMain)"
+                  + " becomesKeyOnlyIfNeeded=\(panel.becomesKeyOnlyIfNeeded)"
+                  + " isKey=\(panel.isKeyWindow) isMain=\(panel.isMainWindow)"
+                  + " styleMask=\(panel.styleMask.rawValue)")
+            print("[WINDOW] hasShadow=\(panel.hasShadow) isOpaque=\(panel.isOpaque)"
+                  + " backgroundColor=\(String(describing: panel.backgroundColor))"
+                  + " titlebarAppearsTransparent=\(panel.titlebarAppearsTransparent)"
+                  + " level=\(panel.level.rawValue) alpha=\(panel.alphaValue)"
+                  + " ignoresMouseEvents=\(panel.ignoresMouseEvents)")
+            panel.makeKey()
+            print("[FOCUS] after makeKey() isKey=\(panel.isKeyWindow) isMain=\(panel.isMainWindow)")
+
+            controller.handlePointer(inside: false)
+            CGWarpMouseCursorPosition(CGPoint(x: panel.frame.midX, y: screenHeight - 400))
+            try? await Task.sleep(nanoseconds: 1_000_000_000)
+            captureWindow("03-closed-pointer-outside-again")
+            print("[CAPTURE] done plainStyle=\(NotchPanel.usesPlainStyle) window=\(panel.windowNumber)")
+            exit(0)
+        }
     }
 
     // MARK: - 窗口坐标探针：查清 WindowServer 合成 bounds 与 frame 的差异
@@ -2075,6 +4711,35 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 }
 
+// MARK: - 裸像素写图
+
+/// 把 RGBA8 缓冲区写成 PNG。
+///
+/// 不用 `NSBitmapImageRep(bitmapDataPlanes:) + setColor(_:atX:y:)`：本机这条路径是 no-op
+/// （写进去读回来全是 0），曾导致 `shoulder-overlay.png` 里 0 个不透明像素。
+/// 这里直接由缓冲区建 `CGImage`，行序为自上而下。
+@discardableResult
+func writeRGBAImage(_ pixels: [UInt8], width: Int, height: Int, to url: URL) -> Bool {
+    guard width > 0, height > 0, pixels.count == width * height * 4,
+          let provider = CGDataProvider(data: Data(pixels) as CFData),
+          let image = CGImage(
+              width: width, height: height,
+              bitsPerComponent: 8, bitsPerPixel: 32, bytesPerRow: width * 4,
+              space: CGColorSpaceCreateDeviceRGB(),
+              bitmapInfo: CGBitmapInfo(rawValue: CGImageAlphaInfo.premultipliedLast.rawValue),
+              provider: provider, decode: nil, shouldInterpolate: false,
+              intent: .defaultIntent
+          ),
+          let png = NSBitmapImageRep(cgImage: image).representation(using: .png, properties: [:])
+    else { return false }
+    return (try? png.write(to: url)) != nil
+}
+
+/// 预乘到 0…255 的分量。
+func rgbaByte(_ v: Double) -> UInt8 {
+    UInt8((min(max(v, 0), 1) * 255).rounded())
+}
+
 // MARK: - 阴影像素探针
 
 /// 在 `--shadow-probe` 渲染出的**不带红线**的图上做像素扫描。
@@ -2429,6 +5094,8 @@ enum DesignLint {
     struct Rule {
         let name: String
         let pattern: String
+        /// 这条规则是否检查「页面内水平内缩」，可用 `horizontalInsetWhitelist` 按行豁免。
+        var usesHorizontalInsetWhitelist = false
     }
 
     struct Result {
@@ -2456,10 +5123,11 @@ enum DesignLint {
 
     /// 递归发现的文件数（含被豁免的）。新增任何 `.swift`（含子目录）都会改变这个数字；
     /// 断言它，是为了让「扫描范围悄悄缩小」变成一条 FAIL，而不是静默漏掉。
-    static let expectedDiscoveredFileCount = 17
+    /// 18 = 原 17 + `NotchHardware.swift`（禁画矩形单一来源）。
+    static let expectedDiscoveredFileCount = 18
     /// 实际检查数 = 发现数 − 豁免数。两个数分开断言：只断言其中一个，
     /// 都可能出现「数量对得上、实际扫的却是另一批文件」的假绿。
-    static let expectedCheckedFileCount = 14
+    static let expectedCheckedFileCount = 15
 
     /// 递归列出 root 下全部 `.swift`，返回相对路径（已排序）。
     static func swiftFiles(under root: URL) -> [String] {
@@ -2504,13 +5172,39 @@ enum DesignLint {
         return hits
     }
 
+    /// 页面层允许出现「水平内缩」的**显式白名单**（SPEC E7）。
+    ///
+    /// 规则本身仍然扫描这些行，只是允许命中；白名单里的行如果哪天被删/改写，
+    /// 清单校验会报「白名单过期」，不会静默失效。清单是代码，改动会进 diff。
+    /// 注意：豁免的是「允许出现内缩」这件事，**不豁免裸数字**——写死 4 照样红。
+    static let horizontalInsetWhitelist: [(path: String, marker: String, reason: String)] = [
+        (
+            "ExpandedContentView.swift",
+            ".padding(.horizontal, vm.contentHorizontalInset)",
+            "骨架层：内容盒左右 23 只在这里注入一次，页面内不得再写水平内边距"
+        ),
+        (
+            "ExpandedContentView.swift",
+            ".padding(.horizontal, DesignSystem.Spacing.xs)",
+            "E7：设置页入口按钮是整行持久填充面，在 23 内容盒内再内缩 4（254 → 246 @ 27）"
+        ),
+    ]
+
     private static let rules: [Rule] = [
+        Rule(name: "缩字号（SPEC §7.7.7：凡是 minimumScaleFactor 一律失败）",
+             pattern: #"\.minimumScaleFactor\("#),
         Rule(name: "裸字号（应改用 .textStyle(DesignSystem.Typography.xxx)）",
              pattern: #"\.font\(\s*\.system\(\s*size:"#),
         Rule(name: "裸行高（应改用 .textStyle(...)）",
              pattern: #"\.lineSpacing\(\s*-?[0-9]"#),
         Rule(name: "裸内边距（应改用 DesignSystem.Spacing）",
              pattern: #"\.padding\([^)]*?[0-9]"#),
+        Rule(name: "页面内裸水平内边距（内容盒由骨架注入一次）",
+             pattern: #"\.padding\(\s*\.(?:horizontal|leading|trailing)\s*,\s*-?[0-9]"#,
+             usesHorizontalInsetWhitelist: true),
+        Rule(name: "页面内裸水平偏移（内容盒由骨架注入一次）",
+             pattern: #"\.offset\(\s*x\s*:\s*-?[0-9]"#,
+             usesHorizontalInsetWhitelist: true),
         Rule(name: "裸间距（应改用 DesignSystem.Spacing）",
              pattern: #"spacing:\s*-?[0-9]"#),
         Rule(name: "裸尺寸（应改用 DesignSystem.Size / 窗口几何）",
@@ -2541,11 +5235,35 @@ enum DesignLint {
         }
     }
 
-    /// 递归扫描。`root` / `exemptions` 可注入，是为了让 selftest 能在临时目录里
-    /// 造一棵假的源码树，用负向用例证明「子目录确实会被扫到」。
+    /// 全仓扫描（**含豁免文件、含子目录**）：`minimumScaleFactor` 必须为零。
+    ///
+    /// 这是 SPEC §7.7.7 的硬红线，不看文件性质：main.swift 与 DesignSystem.swift 也不例外。
+    /// 针串在运行时拼出来，避免门禁把自己的函数名/字符串字面量当成命中。
+    static func minimumScaleFactorHits() -> [String] {
+        let needle = "." + "minimumScale" + "Factor" + "("
+        let sourceDir = sourceRoot
+        var hits: [String] = []
+        for name in swiftFiles(under: sourceDir) {
+            let url = sourceDir.appendingPathComponent(name)
+            guard let source = try? String(contentsOf: url, encoding: .utf8) else { continue }
+            for (index, line) in source.components(separatedBy: .newlines).enumerated() {
+                let trimmed = line.trimmingCharacters(in: .whitespaces)
+                if trimmed.hasPrefix("//") || trimmed.hasPrefix("///") { continue }
+                if line.contains(needle) {
+                    hits.append("\(name):\(index + 1): \(trimmed)")
+                }
+            }
+        }
+        return hits
+    }
+
+    /// 递归扫描。`root` / `exemptions` / `horizontalInsetWhitelist` 可注入，
+    /// 是为了让 selftest 能在临时目录里造一棵假的源码树，用负向用例证明规则真的会命中。
     static func scanUI(
         root: URL = sourceRoot,
-        exemptions: [(path: String, reason: String)] = DesignLint.exemptions
+        exemptions: [(path: String, reason: String)] = DesignLint.exemptions,
+        horizontalInsetWhitelist: [(path: String, marker: String, reason: String)]
+            = DesignLint.horizontalInsetWhitelist
     ) -> Result {
         let all = swiftFiles(under: root)
         let exemptNames = exemptions.map(\.path)
@@ -2555,6 +5273,18 @@ enum DesignLint {
         // 豁免清单指向不存在的文件 = 清单过期，必须报出来，不能默默失效。
         for name in exemptNames where !all.contains(name) {
             violations.append("\(name) 写在豁免清单里，但文件不存在（清单过期）")
+        }
+        // 白名单同样校验：写成代码的豁免一旦对不上实际源码，也要红。
+        var allowedMarkers: [String: [String]] = [:]
+        for entry in horizontalInsetWhitelist {
+            allowedMarkers[entry.path, default: []].append(entry.marker)
+            let url = root.appendingPathComponent(entry.path)
+            let source = (try? String(contentsOf: url, encoding: .utf8)) ?? ""
+            if !source.contains(entry.marker) {
+                violations.append(
+                    "\(entry.path) 白名单过期：找不到「\(entry.marker)」（\(entry.reason)）"
+                )
+            }
         }
 
         for name in checked {
@@ -2568,10 +5298,13 @@ enum DesignLint {
                 let trimmed = line.trimmingCharacters(in: .whitespaces)
                 if trimmed.hasPrefix("//") || trimmed.hasPrefix("///") { continue }
                 for rule in rules {
+                    if rule.usesHorizontalInsetWhitelist,
+                       let markers = allowedMarkers[name],
+                       markers.contains(where: { trimmed.contains($0) }) { continue }
                     guard let regex = try? NSRegularExpression(pattern: rule.pattern) else { continue }
                     let range = NSRange(line.startIndex..<line.endIndex, in: line)
                     guard regex.firstMatch(in: line, range: range) != nil else { continue }
-                    violations.append("\(name):\(index + 1) \(rule.name) -> \(trimmed)")
+                    violations.append("\(name):\(index + 1): \(rule.name) -> \(trimmed)")
                 }
             }
         }
