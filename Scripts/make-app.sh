@@ -81,6 +81,9 @@ if [[ -n "$TAG" ]]; then
     fi
     SHORT_VERSION="${TAG#v}"
     SHORT_VERSION="${SHORT_VERSION%%-*}"
+    # 完整 tag 与通道写进 plist 的独立键：CFBundleShortVersionString 会丢掉 -alphaN 后缀，
+    # 只靠它无法区分 alpha 与正式版，更新检查器和「关于」面板需要这两个键。
+    RELEASE_CHANNEL="$(bash "$ROOT/Scripts/version-check.sh" --stage "$TAG")"
     # CFBundleVersion 规则：优先提交数（单调递增，覆盖任意 tag）；没有 git 时退回
     # 预发布序号（alphaN / RCN 的 N），正式版为 0。两者都不手写。
     if COMMITS="$(git -C "$ROOT" rev-list --count HEAD 2>/dev/null)"; then
@@ -98,6 +101,7 @@ else
     SHORT_VERSION="0.0.0"
     BUILD_NUMBER="0"
     BUILD_SOURCE="dev"
+    RELEASE_CHANNEL="dev"
     echo "[make-app] WARN 当前 HEAD 没有精确 tag：注入 0.0.0/0，仅供本地调试；发布产物必须由 tag 构建" >&2
 fi
 
@@ -139,6 +143,10 @@ cat > "$APP/Contents/Info.plist" <<PLIST
     <true/>
     <key>NSAppleEventsUsageDescription</key>
     <string>读取当前播放的曲目信息，并控制播放/上一首/下一首。</string>
+    <key>BrimioReleaseTag</key>
+    <string>${TAG:-}</string>
+    <key>BrimioChannel</key>
+    <string>${RELEASE_CHANNEL}</string>
 </dict>
 </plist>
 PLIST
@@ -168,6 +176,14 @@ fi
 if [[ "$PLIST_ID" != "$APP_BUNDLE_ID_FINAL" ]]; then
     echo "[make-app] FAIL bundle id 回读不一致：$PLIST_ID" >&2
     exit 1
+fi
+if [[ -n "$TAG" ]]; then
+    PLIST_TAG="$(read_plist BrimioReleaseTag)"
+    PLIST_CHANNEL="$(read_plist BrimioChannel)"
+    if [[ "$PLIST_TAG" != "$TAG" || "$PLIST_CHANNEL" != "$RELEASE_CHANNEL" ]]; then
+        echo "[make-app] FAIL 发布标记回读不一致：tag=$PLIST_TAG channel=$PLIST_CHANNEL 期望=$TAG/$RELEASE_CHANNEL" >&2
+        exit 1
+    fi
 fi
 
 echo "[make-app] ${APP}（未签名）"

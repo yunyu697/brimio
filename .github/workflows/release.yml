@@ -1,9 +1,18 @@
 name: Release
 
+# 说明：本流水线目前因账单问题无法运行（只有仓库所有者能处理）。
+# 真实发布走本机 `Scripts/release.sh`，它做同样的事且不依赖 Actions。
+# 本文件保持可用状态，账单恢复后无需改动即可接管。
+
 on:
   push:
     tags:
       - 'v*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: '已存在的 tag（如 v1.0.0-beta1）'
+        required: true
 
 permissions:
   contents: write
@@ -12,12 +21,13 @@ concurrency:
   group: release-${{ github.ref }}
   cancel-in-progress: false
 
+env:
+  TAG_NAME: ${{ inputs.tag || github.ref_name }}
+
 jobs:
   build-and-release:
     runs-on: macos-latest
     timeout-minutes: 40
-    env:
-      TAG_NAME: ${{ github.ref_name }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -45,26 +55,41 @@ jobs:
           DIST="$PWD/dist" \
           bash Scripts/make-app.sh
 
-      - name: 注入值回读（必须等于 tag）
+      - name: 资产校验（sha256 / 包内 plist / 命名模板 / 架构）
         run: |
-          PLIST="build/Brimio.app/Contents/Info.plist"
-          SHORT="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$PLIST")"
-          BUILD="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleVersion' "$PLIST")"
-          EXPECTED="${TAG_NAME#v}"; EXPECTED="${EXPECTED%%-*}"
-          echo "tag=$TAG_NAME short=$SHORT build=$BUILD expected=$EXPECTED"
-          [ "$SHORT" = "$EXPECTED" ] || { echo "FAIL: CFBundleShortVersionString != tag"; exit 1; }
-
-      - name: 打印 sha256
-        run: |
+          COMMITS="$(git rev-list --count "$TAG_NAME^{commit}")"
           ASSET="$(bash Scripts/naming.sh --asset "$TAG_NAME")"
-          echo "asset=$ASSET" >> "$GITHUB_ENV"
-          shasum -a 256 "dist/$ASSET" | tee "dist/$ASSET.sha256"
-          {
-            echo "### Release $TAG_NAME"
-            echo '```'
-            cat "dist/$ASSET.sha256"
-            echo '```'
-          } >> "$GITHUB_STEP_SUMMARY"
+          echo "ASSET=$ASSET" >> "$GITHUB_ENV"
+          bash Scripts/release-verify.sh --expect-build "$COMMITS" "$TAG_NAME" "dist/$ASSET"
+
+      - name: 首次安装用 dmg（仅 stable）
+        run: |
+          case "$TAG_NAME" in
+            *-alpha*|*-beta*|*-RC*) echo "预发布不出 dmg"; exit 0 ;;
+          esac
+          bash Scripts/make-dmg.sh build/Brimio.app --tag "$TAG_NAME" --out dist
+
+      - name: feed 记录必须已在 tag 内提交
+        # 记录（Release/feed/items.jsonl）由本机 `Scripts/release.sh --add` 写入，
+        # 随发布提交一起进入 tag；CI 不生成、不回写，保证「tag = 可复现的发布内容」。
+        run: |
+          python3 - "$TAG_NAME" <<'PY'
+          import json, os, sys
+          tag = sys.argv[1]
+          path = "Release/feed/items.jsonl"
+          found = False
+          if os.path.exists(path):
+              for line in open(path, encoding="utf-8"):
+                  line = line.strip()
+                  if line and json.loads(line).get("tag") == tag:
+                      found = True
+          if not found:
+              sys.exit(f"FAIL {path} 里没有 {tag}：先在本机跑 Scripts/release.sh --add 并提交")
+          print(f"[ci] feed 记录存在：{tag}")
+          PY
+
+      - name: 生成通道清单
+        run: bash Scripts/release-feed.sh --emit
 
       - name: 创建 GitHub Release 并附产物
         env:
@@ -72,7 +97,7 @@ jobs:
         run: |
           FLAGS=()
           case "$TAG_NAME" in
-            *-alpha*|*-RC*) FLAGS+=(--prerelease) ;;
+            *-alpha*|*-beta*|*-RC*) FLAGS+=(--prerelease --latest=false) ;;
           esac
           gh release create "$TAG_NAME" \
             "dist/$ASSET" \
@@ -80,3 +105,15 @@ jobs:
             --title "$TAG_NAME" \
             --generate-notes \
             "${FLAGS[@]}"
+
+      - name: 更新清单挂到固定 tag（URL 与版本无关）
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release view feed >/dev/null 2>&1 || \
+            gh release create feed --prerelease --latest=false \
+              --title "更新清单" --notes "客户端更新检查读取这两个文件，不要删除本 Release。"
+          gh release upload feed \
+            "dist/feed/feed-stable.json" \
+            "dist/feed/feed-beta.json" \
+            --clobber

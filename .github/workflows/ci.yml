@@ -55,3 +55,7 @@ jobs:
           OUT="$PWD/build/Brimio.app" \
           bash Scripts/make-app.sh
           /usr/libexec/PlistBuddy -c "Print :CFBundleShortVersionString" build/Brimio.app/Contents/Info.plist
+
+      - name: 更新链路模拟（镜像切换 / sha256 / 通道隔离 / 防降级）
+        # 本地起 http 服务，全部离线；任何一条断言失败即失败。
+        run: bash Scripts/update-sim.sh
