@@ -312,42 +312,60 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
             // 1c. 四条形状断言之①③：两态共用同一条构造 + 凹角内必须透背景。
             //
-            // ① 构造（不依赖数值）：顶部角的第一段是二次贝塞尔，起点 (0,0)、控制点 (t,0)、终点 (t,t)。
-            //    这条与参照实现同构；t 是切点偏移，不是 cornerRadius。
+            // ① 构造（与曲线次数无关，只锁几何）：顶部角的第一段必须满足三条
+            //    a) 起点 (0,0)、终点 (t,t)；
+            //    b) 起点切线水平（首个控制点与起点同 y）、终点切线垂直（次个控制点与终点同 x）；
+            //    c) u = 0.5 处必须过 (0.75t, 0.25t)——这条是「内凹肩」的形状不变量，
+            //       像素断言里的 0.914t 解析解就是由它推出来的；改成外凸或方角都会让中点跑掉。
+            //    t 是切点偏移，不是 cornerRadius。
             let constructionRect = CGRect(x: 0, y: 0, width: 300, height: 148)
-            func shoulderQuad(t: CGFloat) -> (start: CGPoint, control: CGPoint, end: CGPoint)? {
+            func shoulderCurve(t: CGFloat) -> (start: CGPoint, c1: CGPoint, c2: CGPoint, end: CGPoint)? {
                 let path = NotchShape(topTangentOffset: t, bottomTangentOffset: 24)
                     .path(in: constructionRect)
                 var start: CGPoint?
-                var quad: (control: CGPoint, end: CGPoint)?
+                var curve: (CGPoint, CGPoint, CGPoint)?
                 path.forEach { element in
                     switch element {
                     case .move(let point):
                         if start == nil { start = point }
-                    case .quadCurve(let to, let control):
-                        if quad == nil { quad = (control, to) }
+                    case .curve(let to, let control1, let control2):
+                        if curve == nil { curve = (control1, control2, to) }
                     default:
                         break
                     }
                 }
-                guard let start, let quad else { return nil }
-                return (start, quad.control, quad.end)
+                guard let start, let curve else { return nil }
+                return (start, curve.0, curve.1, curve.2)
             }
             let constructionOffsets = [
                 ScreenGeometry.shoulderTangentOffset.closed,
                 ScreenGeometry.shoulderTangentOffset.opened
             ]
+            var constructionDetail: [String] = []
             let constructionOK = constructionOffsets.allSatisfy { t in
-                guard let quad = shoulderQuad(t: t) else { return false }
-                return abs(quad.start.x) < 0.001 && abs(quad.start.y) < 0.001
-                    && abs(quad.control.x - t) < 0.001 && abs(quad.control.y) < 0.001
-                    && abs(quad.end.x - t) < 0.001 && abs(quad.end.y - t) < 0.001
+                guard let c = shoulderCurve(t: t) else {
+                    constructionDetail.append("t=\(t): 首段不是三次曲线")
+                    return false
+                }
+                // u = 0.5 的求值：(P0 + 3C1 + 3C2 + P3) / 8
+                let midX = (c.start.x + 3 * c.c1.x + 3 * c.c2.x + c.end.x) / 8
+                let midY = (c.start.y + 3 * c.c1.y + 3 * c.c2.y + c.end.y) / 8
+                let endpoints = abs(c.start.x) < 0.001 && abs(c.start.y) < 0.001
+                    && abs(c.end.x - t) < 0.001 && abs(c.end.y - t) < 0.001
+                let tangents = abs(c.c1.y - c.start.y) < 0.001
+                    && abs(c.c2.x - c.end.x) < 0.001
+                let midpoint = abs(midX - 0.75 * t) < 0.001 && abs(midY - 0.25 * t) < 0.001
+                constructionDetail.append(String(
+                    format: "t=%.0f 中点=(%.2f,%.2f) 期望=(%.2f,%.2f) 端点=%@ 切线=%@",
+                    t, midX, midY, 0.75 * t, 0.25 * t,
+                    endpoints ? "ok" : "BAD", tangents ? "ok" : "BAD"
+                ))
+                return endpoints && tangents && midpoint
             }
             check(
                 constructionOK,
-                "both states share one shoulder construction: control (t,0), end (t,t)",
-                "t=" + constructionOffsets.map { String(format: "%.0f", $0) }.joined(separator: "/")
-                    + "；起点 (0,0) 控点 (t,0) 终点 (t,t)"
+                "both states share one concave-shoulder construction (midpoint 0.75t, 0.25t)",
+                constructionDetail.joined(separator: "；")
             )
 
             // ③ 凹角内必须透背景（像素证据）。
@@ -2604,7 +2622,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             "corner-right": "同 corner-left",
             "solid-left": "设计常量：肩部内侧 t+2 必须落在实体上（t 取当前状态）",
             "solid-right": "同 solid-left（带徽标时按本体宽度定位）",
-            "shoulder-boundary": "二次曲线解析解 0.914t；t 取当前状态（闭合 6 / 展开 19，来源=参照实现，绝对值未实测）",
+            "shoulder-boundary": "内凹肩解析解 0.914t（由中点 (0.75t,0.25t) 推出）；t 取当前状态（闭合 6 / 展开 19，绝对值未实测）",
             "shoulder-arc": "design 抗锯齿过渡带宽度 1...4px（同色 overscan 只遮 1px）",
             "shoulder-family": "解析内收 t(2√(y/t)−y/t)，容差 0.75pt；两态共用同一条构造，t 按状态取 6/19（同族=构造相同，不是数值相同）",
             "edge-left": "windowFrame 量化到整设备像素（backingScaleFactor）+ 同色 overscan 1px",
@@ -4097,7 +4115,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                     ]
                 }
                 writeFolderMetrics(folder, [
-                    "analytic": "顶部肩为二次曲线：u(v)=2√v−v（v=y/t），y=t/2 处 u=0.914；t=0 退化为直边；外凸圆弧在 y=t/2 处 u=0.134",
+                    "analytic": "内凹肩解析解：u(v)=2√v−v（v=y/t），y=t/2 处 u=0.914；t=0 退化为直边；外凸圆弧在 y=t/2 处 u=0.134",
                     "variants": reports,
                     "overlay": overlayReport
                 ])
