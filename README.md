@@ -36,7 +36,7 @@ swift build --scratch-path /tmp/notch-build \
 | 文件 | 职责 |
 |---|---|
 | `ScreenGeometry.swift` | 尺寸常量、刘海判定、屏幕顶部矩形计算、屏幕 UUID |
-| `NotchShape.swift` | 刘海外形：顶边两角各一段控制点落在顶边上的二次曲线、底部外扩曲线，顶部圆角闭合 6 / 展开 0、底部 14/24，两个圆角都参与 `animatableData` |
+| `NotchShape.swift` | 刘海外形：顶边两角各一段控制点落在顶边上的二次曲线、底部外扩曲线；参数是**切点偏移 t**（不是 cornerRadius），顶部闭合 6 / 展开 19、底部 14/24，两个偏移都参与 `animatableData` |
 | `NotchPanel.swift` | `NSPanel` 子类：无边框/非激活/置顶/透明，`setInteractive(_:)` 控制点击穿透 |
 | `NotchViewModel.swift` | `closed/open` 状态机、`notchSize`、唯一动画源 |
 | `NotchWindowController.swift` | 建窗、定位、鼠标监听、延时开合、穿透切换 |
@@ -83,7 +83,7 @@ swift build --scratch-path /tmp/notch-build \
 
 此外 animated 子树里不能出现 `if isOpen { A } else { B }` 这种类型切换：SwiftUI 会当成「移除 + 插入」，动画期间同时存在两份各自插值的副本（采样序列会交出错乱的两条曲线）。所以内容固定为一层 `ZStack`：黑底常驻，展开态文字用 `opacity` 叠加。
 
-顶部圆角 6 → 0、底部圆角 14 → 24 也随状态变化，由 `NotchShape.animatableData` 连续插值（在该文件里加了一行 `--animate-probe` 用的记录钩子，已用 `#if DEBUG` 隔离；路径几何本身不动，只有圆角在插值）。
+顶部肩是**切点偏移 t**（不是 cornerRadius）：闭合 6 / 展开 19，来源=参照实现（同一构造、同一窗口侧口径，6→6 标定成立；绝对值未实测）。底部切点偏移 14 → 24 随状态变化，由 `NotchShape.animatableData` 连续插值（在该文件里加了一行 `--animate-probe` 用的记录钩子，已用 `#if DEBUG` 隔离；路径几何本身不动，只有两个偏移在插值）。
 
 **5. 开合时序**
 
@@ -311,31 +311,35 @@ swift build --scratch-path /tmp/notch-build \
 [SELFTEST] PASS  hovering during a file drag does not expand the notch  (open=false after 0.45s (hoverDelay=0.3s))
 [SELFTEST] PASS  drag end restores pass-through
 [SELFTEST] PASS  pass-through still on 200ms after the drag ends
-[LINT] discovered 17 file(s): AudioPresence.swift, …, Generated/Naming.swift, …, main.swift
-[LINT] checked 14 file(s): AudioPresence.swift, ClosedMediaBadge.swift, ExpandedContentView.swift, ExpandedItem.swift, FileShelfView.swift, MediaService.swift, NotchPanel.swift, NotchRootView.swift, NotchShape.swift, NotchViewModel.swift, NotchWindowController.swift, PlayerRegistry.swift, PlayerSettingsWindow.swift, ScreenGeometry.swift
-[SELFTEST] PASS  lint discovers every swift file recursively (subdirectories included)  (17/17 discovered)
-[SELFTEST] PASS  lint checks discovered files minus explicit exemptions  (14/14 checked, 3 exempt)
+[LINT] discovered 18 file(s): AudioPresence.swift, …, Generated/Naming.swift, …, main.swift
+[LINT] checked 15 file(s): AudioPresence.swift, ClosedMediaBadge.swift, ExpandedContentView.swift, ExpandedItem.swift, FileShelfView.swift, MediaService.swift, NotchHardware.swift, NotchPanel.swift, NotchRootView.swift, NotchShape.swift, NotchViewModel.swift, NotchWindowController.swift, PlayerRegistry.swift, PlayerSettingsWindow.swift, ScreenGeometry.swift
+[SELFTEST] PASS  lint discovers every swift file recursively (subdirectories included)  (18/18 discovered)
+[SELFTEST] PASS  lint checks discovered files minus explicit exemptions  (15/15 checked, 3 exempt)
 [SELFTEST] PASS  recursion proven by a negative case in a temp subdirectory  (discovered=1 violations=1 first=Views/FakeView.swift:1 …)
-[SELFTEST] PASS  view layer uses only DesignSystem tokens  (14 file(s) clean)
+[SELFTEST] PASS  view layer uses only DesignSystem tokens  (15 file(s) clean)
 [SELFTEST] PASS  closed layer contains no text nodes  (NotchRootView.swift: 0 text)
 [SELFTEST] PASS  app sources never call the accessibility API  (0 hit(s) outside main.swift)
-[SELFTEST] PASS all 72 checks  source=NSScreen
+[SELFTEST] PASS all 86 checks  source=NSScreen
 ```
 
-这 72 项覆盖的都是「可断言的事实」：
+这 86 项覆盖的都是「可断言的事实」：
 
 | 类别 | 项数 | 具体项 |
 |---|---|---|
-| 窗口几何与层级 | 8 | 几何来源（`source=NSScreen` / `source=injected`）、可见、尺寸 316×232、比最大页形状宽、顶边贴屏幕顶、水平居中、frame 与 `ScreenGeometry` 一致、level = `.mainMenu + 3` |
-| WindowServer 合成 | 4 | 窗口已注册、面板合成 rect 与同 frame 的普通窗口逐项相同（0 容差）、frame 经标定映射进 CG 全局空间后一致（≤2.5pt）、bounds 贴屏幕顶且水平居中 |
+| 屏幕几何与硬件矩形 | 8 | 几何来源（`source=NSScreen` / `source=injected`）、硬件矩形 = 左右安全区之间的补集（179×32）、闭合徽标距硬件右缘 +4pt、展开内容起点在硬件下缘 +4pt、按配置只算一次、配置变化与主动失效各自重算、同配置结果相同 |
+| 形状参数 | 5 | ①两态共用同一条构造（控制点 `(t,0)`、终点 `(t,t)`）；②闭合、展开凹肩各一条（耳朵透明、首黑 `0.914t`）；③切点偏移闭合 6 / 展开 19（同量纲标定） |
+| 窗口几何与层级 | 7 | 可见、**固定 316×252**、比最大页形状宽（spring 超调余量）、顶边贴屏幕顶、水平居中、frame 与 `ScreenGeometry` 一致、level = `.mainMenu + 3` |
 | 窗口行为枚举 | 1 | `canJoinAllSpaces` + `fullScreenAuxiliary` 已设置 |
-| 状态机与穿透 | 7 | 初始闭合、闭合穿透、hover 展开、展开接收事件、open 尺寸、离开收起、闭合恢复穿透 |
-| 分页路由与尺寸 | 14 | 默认首页、四页都能到达、四页尺寸互不相同、四边共用同一档 padding、chrome ≤ 28pt、三桶高度等于面板高、三桶占比合计 100%、首页内容块最大、每页内容份额 ≥ 30%（逐页报数、豁免显式打印）、闭合态缩略图只向右加宽、切页仍展开、尺寸跟随页面、切页不动窗口 frame、切回首页尺寸还原 |
-| 媒体降级 | 3 | 只有 IOPM 状态且是音乐类播放器时用右侧槽位放图标（+28pt，绝不居中放字）、没有音频进程时闭合态完全不占位、非音乐类音频进程（Chrome/Safari/微信）也不点亮闭合态 |
-| 形状参数 | 2 | 闭合顶部圆角 6、展开顶部圆角 0 |
-| 终态稳定性 | 3 | 展开后 frame 不变、闭合高度恢复（宽度允许带一枚徽标）、收起后 frame 不变 |
-| 界面规范 | 6 | **递归**发现 17 个 `.swift`（含 `Generated/Naming.swift`，断言 `expectedDiscoveredFileCount`）、实际检查 14 个（断言 `expectedCheckedFileCount`）、生成文件以路径出现在显式豁免清单且写明原因、子目录负向用例证明递归生效；这 14 个文件里没有裸的字号/行高/间距/尺寸/圆角/颜色；闭合层（`NotchRootView.swift`）里没有任何 `Text(`/`Label(`；**除 `main.swift` 探针外没有任何 `AXUIElement` / `AXIsProcessTrusted` 调用**（静态扫源码，防止辅助功能权限悄悄回流） |
-| 文件架 | 16 | 五状态（0/1/2/3/≥4）逐个断言 shapeSize 与内容份额、面板高度上限 212、高度由条目数派生、新文件置顶且同路径去重、大小字符串定宽、单条移除保留其余、**move 拖出后立即消失**、**外部删除后下一次用户动作触发移除**、copy 拖出保留条目、清空只删引用、闭合态拖入接收、拖动悬停 0.45s 不展开、松手恢复穿透、松手 200ms 后仍是穿透 |
+| WindowServer 合成 | 4 | 窗口已注册、面板合成 rect 与同 frame 的普通窗口逐项相同（0 容差）、frame 经标定映射进 CG 全局空间后一致（≤2.5pt）、bounds 贴屏幕顶且水平居中 |
+| 状态机与穿透 | 4 | 初始闭合、闭合穿透、离开收起、闭合恢复穿透 |
+| 开合与终态 | 10 | hover 展开、展开接收事件、open 尺寸跟随首页、展开后 frame 不变、切页仍展开、尺寸跟随页面、切页 frame 不变、切回首页尺寸还原、闭合尺寸还原（宽度允许一枚徽标）、收起后 frame 不变 |
+| 切点偏移的连带量 | 4 | 内容内缩 = `t + 4`（闭合 10 / 展开 23）、`bottom` 保持 24 且侧壁/底边仍为正、闭合竖向预算 20<32、展开竖向预算 43<最小页高 107 |
+| 分页路由与尺寸 | 6 | 默认首页、四页都能到达、四页尺寸互不相同、高度 = 上内边距 + chrome + 间距 + 内容 + 下内边距、chrome ≤ 28pt、四桶相加等于面板高 |
+| 高度占比 | 3 | 四桶占比合计 100%、首页内容块最大、每页按内容量走 30% 比例或固定开销判据 |
+| 媒体降级 | 4 | 只有 IOPM 状态且是音乐类播放器时用右侧槽位放图标（+28pt，绝不居中放字）、没有音频进程时闭合态完全不占位、非音乐类音频进程（Chrome/Safari/微信）也不点亮闭合态、徽标只向右加宽 |
+| 文件架尺寸 | 3 | 五状态（0/1/2/3/≥4）逐个断言 shapeSize 与内容规则、面板高度上限 232、高度由条目数派生 |
+| 文件架行为 | 19 | 新文件置顶且同路径去重、大小字符串定宽、单条移除保留其余、**move 拖出后立即消失**、**外部删除后下一次用户动作触发移除**、copy 拖出保留条目、清空只删引用、闭合态拖入接收、拖动悬停 0.45s 不展开、松手恢复穿透、松手 200ms 后仍是穿透、**拖出只写 `.fileURL`**、**无修饰键 copy / ⌘ move**、**落点必须在形状路径内**、**拖入自动滚动只在上下边缘走一行**，以及上述断言的前置状态 |
+| 界面规范 | 7 | **递归**发现 18 个 `.swift`、实际检查 15 个（生成文件以路径进显式豁免清单并写明原因）、子目录负向用例证明递归生效、这 15 个文件里没有裸的字号/行高/间距/尺寸/圆角/颜色、闭合层（`NotchRootView.swift`）里没有任何 `Text(`/`Label(`、**除 `main.swift` 探针外没有任何 `AXUIElement` / `AXIsProcessTrusted` 调用** |
 | 播放器兼容 | 7 | 第三方默认关闭、开启后持久化、能再关回、系统播放器恒开且不可关、每项写全权限/收益/后果、**权限声明逐条等于代码实际请求**、**声明 Automation 的 App 与 AppleScript 覆盖集合完全相等** |
 
 ### 无屏（CI）模式
@@ -344,10 +348,10 @@ swift build --scratch-path /tmp/notch-build \
 
 | 模式 | 几何来源断言输出 | PASS |
 |---|---|---|
-| 默认（NSScreen） | `source=NSScreen name=Built-in Retina Display frame=1470x956 inset=32` | 72 |
-| 注入（headless） | `source=injected name=injected 1512x982 frame=1512x982 inset=32` | 68 |
+| 默认（NSScreen） | `source=NSScreen name=Built-in Retina Display frame=1470x956 inset=32` | 86 |
+| 注入（headless） | `source=injected name=injected 1512x982 frame=1512x982 inset=32` | 82 |
 
-差的 4 条全部来自「WindowServer 注册 / CG 坐标空间对齐」一段：窗口是否真的出现在屏幕上、与同 frame 对照窗口的合成结果是否完全一致、CG bounds 是否等于 frame 映射值、是否贴住屏幕顶。这一段要做坐标空间换算，必须有真实屏幕，因此注入模式下不执行，并在日志里显式列出「本环境不覆盖」的 4 项（真实 `NSScreen` 读数、窗口层级与跨屏跟随、真实指针位置相关的 hover/拖放采样、屏幕录制与视觉复核），不是静默跳过。
+差的 4 条全部来自「WindowServer 注册 / CG 坐标空间对齐」一段：窗口是否真的出现在屏幕上、与同 frame 对照窗口的合成结果是否完全一致、CG bounds 是否等于 frame 映射值、是否贴住屏幕顶。这一段要做坐标空间换算，必须有真实屏幕，因此注入模式下不执行，并在日志里显式列出 5 项「本环境不覆盖」（真实 `NSScreen` 读数、窗口层级与跨屏跟随、真实指针位置相关的 hover/拖放采样、屏幕录制与视觉复核、菜单栏自动隐藏状态下的 auxiliary 信号），不是静默跳过。
 
 CI 的 verify 步骤除了跑注入模式，还会 `grep` 两件事：`geometry source is injected` 与 `本环境不覆盖`。任一没出现就失败——防止「加了 flag 但代码仍读 NSScreen」或「静默 skip 后照样报绿」。
 
@@ -360,11 +364,11 @@ CI 的 verify 步骤除了跑注入模式，还会 `grep` 两件事：`geometry 
 
 说明：
 
-- `window frame` 是 AppKit 坐标（原点左下）`{{577, 724}, {316, 232}}`，屏幕高 956，`724 + 232 = 956`，顶边正好在 956；
+- `window frame` 是 AppKit 坐标（原点左下）`{{577, 704}, {316, 252}}`，屏幕高 956，`704 + 252 = 956`，顶边正好在 956；
 - `layer=27` 等于 `.mainMenu(24) + 3`，证明窗口层级高于菜单栏；恢复 `utilityWindow` / `hudWindow` 之后这一项不变；
 - `window-info` 里的 CG bounds 是 `286×134 @ (592,47)`（那一轮窗口还是 316×148 时的读数），**不是启动瞬态、也不是面板样式造成的**，而是 `CGWindowList` 全局空间把整块桌面缩到了 0.90 —— 根因与标定方式见下一节；
-- `contentLayout` / `content` 都是 `{{0,0},{316,232}}`、`safeAreaTop=0.0`：SwiftUI 内容没有被安全区或标题栏内缩，形状顶边就是窗口顶边；
-- 整个过程中窗口 frame 始终是 316×232，开合只改内容。
+- `contentLayout` / `content` 都是 `{{0,0},{316,252}}`、`safeAreaTop=0.0`：SwiftUI 内容没有被安全区或标题栏内缩，形状顶边就是窗口顶边；
+- 整个过程中窗口 frame 始终是 316×252，开合只改内容。
 
 `Brimio --e2e`：真实指针移动验证 PASS，退出码 0：
 
@@ -419,7 +423,7 @@ CI 的 verify 步骤除了跑注入模式，还会 `grep` 两件事：`geometry 
 
 `--render` 出图（`Snapshots/closed.png`、`Snapshots/open.png`，灰底、红 1px 线标出窗口顶边）：
 
-- **能证明**：形状顶边与窗口顶边齐平（红线正好压住形状上沿）、展开态顶部两角是方角而不是露出背景三角、左右两侧形状 + 阴影完整没有被平切、底部圆角/文字/分隔线的排布；
+- **能证明**：形状顶边与窗口顶边齐平（红线正好压住形状上沿）、展开态顶部两角是与闭合同一族的内凹肩（肩外透出背景，不是直角、也不是外凸大圆角）、左右两侧形状 + 阴影完整没有被平切、底部圆角/文字/分隔线的排布；
 - **不能证明**：真实窗口在屏幕上的合成结果（`ImageRenderer` 是离屏绘制，不经过 WindowServer，也没有真实 `NSPanel` 参与）、真实桌面背景下的观感、动画是否流畅、以及全屏/多 Space 下的表现；
 - 另外，本机终端进程**没有屏幕录制权限**，`screencapture` 返回 `could not create image from display`，所以**没有实拍截图**，不能用渲染图冒充。窗口是否真的在屏幕上、是否被系统裁切，由 `--selftest` 里的 `CGWindowList`（`layer=27`、`316×232 @ (577,0)`、minY=0）来佐证。
 
@@ -427,13 +431,13 @@ CI 的 verify 步骤除了跑注入模式，还会 `grep` 两件事：`geometry 
 
 | 参数 | 取值 | 取值理由 |
 |---|---|---|
-| 窗口尺寸 | 316×232 | 宽度 = 最大页形状宽 300 + 动画超调 16（左右各 8）= 316；高度 = 最大页形状高 212 + 阴影余量 20 = 232。窗口从创建到销毁都不 resize，避免 resize 带来的坐标抖动。 |
+| 窗口尺寸 | 316×252 | 宽度 = 最大页形状宽 300 + 动画超调 16（左右各 8）= 316；高度 = 最大页形状高 232 + 阴影余量 20 = 252。窗口从创建到销毁都不 resize，避免 resize 带来的坐标抖动。 |
 | 窗口宽度动画余量 | 16（左右各 8） | 宽度也逐帧插值，欠阻尼 spring 必然超调（实测峰值比终值多约 5.4pt）。左右各留 8pt，保证超调那几帧两侧都不被窗口边界平切。 |
-| 展开内容尺寸上限 `maxSize` | 640×212 | 高度 212 = 文件架视口 140 + chrome 28 + 标题 44，正好容纳「3 整行 + 第 4 行露出 20pt」；宽度 640 是四页内容的最宽上限，再宽形状与菜单栏的比例就失衡。 |
+| 展开内容尺寸上限 `maxSize` | 640×232 | 高度 232 = 文件架视口 140 + chrome 28 + 自有留白 44 + 系统让位 20，正好容纳「3 整行 + 第 4 行露出 20pt」；宽度 640 是四页内容的最宽上限，再宽形状与菜单栏的比例就失衡。 |
 | 阴影余量 `shadowPadding` | 20 | 阴影 radius 4 + 下移 2 之后四周仍要留白：20pt 足够容纳底部实测 8.0pt 的扩散，保证阴影不被窗口裁切。 |
-| 展开态顶部圆角 | 0（方角） | 面板顶边压在屏幕顶边上，任何正圆角都会在顶边与形状之间露出左右两个背景三角；方角让顶边整条与屏幕顶边齐平。 |
-| 展开态底部圆角 | 24 | 底部悬空，24 与 640 的宽度比接近整圆收口，不显尖锐；与顶部方角形成「上平下圆」的接触关系。 |
-| 闭合态顶部圆角 | 6 | 闭合形状就是刘海本体的视觉替身：6pt 与物理刘海下缘的弧度衔接，顶部中段仍保持平直贴边。 |
+| 顶部凹肩切点偏移 t | 闭合 6 / 展开 19（来源=**参照实现**，绝对值未实测） | 参数是切点偏移，不是 cornerRadius：控制点在角点沿顶边内移 t 处、终点 `(t,t)`，二次曲线中点过 `(0.75t, 0.25t)`，比同半径圆弧更贴角点约 6%。**6→6 标定成立**：同一构造 + 同一窗口侧口径（宽=硬件带+4、闭合高=`safeAreaInsets.top`、顶边贴屏顶；本机 179×32 → 183×32），双方量纲一致，参照的 19 直接映射为 19。真机照片（`~/Downloads/IMG_0013.HEIC`）肩部耳区与暗背景亮度差 < 5/255，量不出绝对数值，所以 6 与 19 都只算「与参照同档」；但 19/6 的比值与参照一致。曾经把 19 当外凸是误判——那是把 19 喂进了圆角通道；作为切点偏移，19 的 y=t/2 首黑在 `0.914×19=17.37`，是内凹。 |
+| 展开态底部圆角 | 24 | 底部悬空，24 与 640 的宽度比接近整圆收口，不显尖锐；与顶部内凹肩形成「上收下放」的接触关系。 |
+| 闭合态顶部切点偏移 | 6（同上的绝对值口径） | 闭合形状是刘海本体的视觉替身；与展开 19 共用同一条构造，但数值按状态取，不再要求同值。该值来自参照实现，没有独立实测。 |
 | 闭合态底部圆角 | 14 | 闭合高度只有 32，14 小于半高，两侧仍留直线段；该值参与 `animatableData`，从 14 连续插值到展开的 24。 |
 | 闭合宽度算法 | `frame.width - left.width - right.width + 4` | 用屏幕顶部的左右安全区（`auxiliaryTopLeftArea` / `auxiliaryTopRightArea`）反推物理刘海宽度，任何机型都自适应。 |
 | 闭合宽度补偿 | +4 | 四处各 1pt 抗锯齿补偿：刘海边缘落在半像素边界上，不补会在形状与菜单栏之间露出 1px 亮缝。 |
@@ -463,7 +467,11 @@ CI 的 verify 步骤除了跑注入模式，还会 `grep` 两件事：`geometry 
 4. **闭合态绘制宽度**：形状宽度直接用 `closedSize.width`，肩部随顶部圆角 6 内收（体内 171pt），顶边仍严格在 y=0。若要让肩部与外扩量完全对齐，可把宽度改成 `closedSize.width + 2 × closed.top`。
 5. **手势**：demo 不含拖拽手势，灵敏度 200 只记录未使用。
 6. **窗口宽度留出超调余量**：宽度也逐帧插值，spring 超调那几帧必须落在窗口内，因此窗口宽 = 最大页形状宽 + 16（左右各 8）。`--animate-probe` 的 `contained=true` 就是守这一条；窗口加宽不影响闭合宽度（仍是 183）、命中矩形（仍是 640×190 / 183×32）和居中位置（`midX` 仍等于屏幕中线）。
-7. **展开态顶部方角（0）**：面板顶边已经压在屏幕顶边上，19pt 圆角会在顶边与形状之间露出左右两个背景三角；改方角后顶边整条齐平，闭合态保持 6pt 圆角。
+7. **展开态顶部内凹肩（闭合 6 / 展开 19，同一构造）**：早先把它写成 0（方角），把直角当成了规格、基线全绿；后来一度把展开也定成 6，理由是「同族」——但**同族 = 构造相同，不是数值相同**。参照实现是闭合 `top 6 / bottom 14`、展开 `top 19 / bottom 24`，用同一条 quad 构造（控制点 `(t,0)`、终点 `(t,t)`、起点切线水平）；6→6 标定成立（同一构造 + 同一窗口侧口径），所以参照的 19 直接映射成我们的 19。上一轮判「19 是外凸」是喂错了通道——把 t 当 `cornerRadius` 用就会得到外凸；按切点偏移喂 19，y=t/2 的首个不透明像素在 `0.914×19 = 17.37`，是内凹（`corner-variants/open-t19-spec` 实测 +17.5，外凸对照 `convex-t19` 实测 +2.5）。断言在 `--selftest`（`both states share one shoulder construction` / `closed|open shoulder tangent offset = reference 6|19` / `closed|open concave shoulder: ... 0.914t` / `top-driven inset`）与 `--render-baseline`（`shoulder-boundary` / `shoulder-arc` / `shoulder-family` / `shoulder-overlay`）。
+8. **内容左右内缩改由 `t` 驱动**：`contentHorizontalInset = t + NotchHardware.contentGap(4)`，闭合 10 / 展开 23；内容宽同步收窄 14pt（254 / 202 / 182 / 254），面板宽 300 / 248 / 228 / 300 保持不变。旧版固定 16 时，展开态内容盒左缘在 `x0+16`、侧壁在 `x0+19`，抓帧实测最早内容像素正好落在 27.0pt（=侧壁），也就是被裁掉 3pt；现在实测净间隙 `4.5 / 7 / 10`（首页 / 文件架 0 条 / 文件架 ≥2 条），全部 ≥ 下限 4 − 0.5。守这条的是 `--render-baseline` 的 `content-clearance`（逐态；闭合 idle 无内容记「不适用」，闭合 playing 量到徽标净间隙 179pt），metrics 里写 `leftClearancePt` / `leftClearanceFloorPt`。
+9. **竖向预算 `top + bottom < 面板高`**：闭合 6 + 14 = 20 < 32；展开 19 + 24 = 43 < 最小页高 107（最大页 232 更宽松）。`bottom` 保持 24、不纳入状态驱动：侧壁 = 高 − 43，最小仍 64pt（计时器）；底边直线段 = 宽 − 48，最小 180pt（计时器），都不需要为状态单独取值。断言在 `--selftest` 的 `closed|open vertical budget` 与 `bottom stays 24`。
+10. **闭合态顶边直边 171pt < 硬件带 179pt**：t=6 在顶边两侧各切掉 6pt，直边 = 183 − 12 = 171，比硬件带窄 8pt（每侧 4pt）。抓帧实测（`closed-idle`）：肩部以下第一行墙距 171.5pt、硬件带 179.0pt，左右未被面板覆盖 3.5 / 4.0pt；顶部 0…6pt 里带内 α=0 的像素 129 个（2x），全部是肩部楔形——它们落在 `auxiliaryTopLeft/RightArea` 反推的硬件矩形内，物理上是刘海本体（黑），所以看不见；带外 185 个来自「183 比 179 多出的每侧 2pt（+4 补偿）」加 2pt 采样窗，位置在菜单栏上、同为深色。真正会被这条断言拦住的是 `t` 掉到 2pt 以下：墙会跑到硬件矩形外，面板开始在刘海外涂黑（不是露背景，是反方向的涂黑）。`closed-top-straight` 守「墙左右缘 ⊆ 硬件矩形」+「墙距 = 宽 − 2t」，并把墙距、未覆盖宽度、带内/带外透明像素数写进 `hardwareBand` metrics。闭合 playing 的整体宽度向右加宽到 211（徽标），左右不再对称，这条只对 idle 量。
+11. **`+4` 数值相同、语义不同，保持现状**：闭合宽度 `+4` 是「半像素边界上的四处 1pt 抗锯齿补偿」，`NotchHardware.contentGap` 的 `4` 是「内容/遮缝条与侧壁之间的净间距」，两者只是碰巧同为 4，不合并成一个常量，也不互相解释。
 
 ## 修复记录（顶部两侧发空）
 
@@ -473,7 +481,7 @@ CI 的 verify 步骤除了跑注入模式，还会 `grep` 两件事：`geometry 
 2. `NotchRootView.swift`：布局改成 `VStack(spacing: 0)` + `.frame(maxWidth/maxHeight, alignment: .top)`，内容严格顶对齐；去掉旧版多余的 `Color.clear` 与嵌套 frame；加 `.ignoresSafeArea()`；补上顶部 1pt 黑线和 chin 矩形。
 3. `NotchPanel.swift`：`NotchHostingView` 覆写 `safeAreaInsets` 返回零。（当时还把 `styleMask` 简化成了 `[.borderless, .nonactivatingPanel]`，理由是「`utilityWindow`/`hudWindow` 会带标题栏内边距」——这个判断是错的，见下面审核修复记录第 2 条，现已恢复。）
 4. `ScreenGeometry.swift`：补齐 `cornerRadiusInsets`、三种刘海高度模式、`menuBarHeight`，每个常量都注明取值依据（见「几何与动效的取值依据」）。
-5. `NotchViewModel.swift`：加 `topCornerRadius` / `bottomCornerRadius` / `chinHeight` / `chinWidth`，开合各用一条 spring（0.42/0.8、0.45/1.0）。
+5. `NotchViewModel.swift`：加 `topTangentOffset` / `bottomTangentOffset` / `chinHeight` / `chinWidth`，开合各用一条 spring（0.42/0.8、0.45/1.0）。
 6. `NotchWindowController.swift`：hover 延时改为 0.3s / 0.1s，建 VM 时传入菜单栏高度，日志补充 `contentLayout`、`safeAreaTop`、`menuBar`、`chin`。
 7. `main.swift`：新增 `--render <dir>` 离屏渲染（`Snapshots/` 的来源）；`--show-open` 打开后打印 `show-open -> open`。
 
@@ -507,7 +515,7 @@ CI 的 verify 步骤除了跑注入模式，还会 `grep` 两件事：`geometry 
 1. **动画期形状被窗口裁切**：上一版窗口宽 640 = 展开宽度，而宽度也参与动画，0.42/0.8 的 spring 峰值到 645.4，超出的 5.4pt 被窗口边界平切。改法：`ScreenGeometry.animationOvershootPadding = 16`，窗口宽度变成 656（左右各 8pt，画布仍居中，VStack 的水平对齐把 640 宽的内容居中放置），`openSize` 保持 640×190 不变。`--animate-probe` 新增峰值校验，输出 `window=656.0x210.0 peak=645.4x191.9 contained=true`，并把它纳入 PASS 条件（不满足则退出码 2）。
 2. **`styleMask` 回退**：恢复成 `[.borderless, .nonactivatingPanel, .utilityWindow, .hudWindow]`（`.borderless` 的 rawValue 是 0，写不写都一样，保留只为把「无标题栏」显式写进 styleMask）。复查结论：`contentLayout` / `content` 仍是 `{{0,0},{656,210}}`、`safeAreaTop=0`，`level` 仍是 27，`collectionBehavior` raw 337（含 `canJoinAllSpaces` + `fullScreenAuxiliary`），合成稳定后的 `CGWindowList` bounds 是 `656×210 @ (407,0)`、minY=0，说明这三项 flag 没有引入内边距。**之前那次「简化」为什么没破坏表现**：上一版把 CGWindowList 在启动后约 200ms 内报出的瞬时内缩 bounds（当时 `630×206 @ (420,2)`，本次同样有 `646×206 @ (412,2)`）误当成 HUD 样式带来的永久内边距；实际那是 WindowServer 首次合成未完成时的中间状态，等 1~2 秒后就是完整的窗口 frame。所以简化前后肉眼无差别，简化本身也没解决问题——因为它本来不是问题。
 3. **采样钩子污染生产路径**：`NotchLayoutProbe` / `SizeProbe` / `DebugSizeProbe` 全部关进 `#if DEBUG`，`NotchShape.animatableData` 里的记录调用也用 `#if DEBUG` 包住；Release 构建下这些类型不存在、逐帧插值不做任何额外写入，`--animate-probe` 在 Release 下直接提示不可用。Debug 构建下还要 `isEnabled`（只有 `--animate-probe` 打开）才真正记录。
-4. **展开态顶部两角改方角**：`NotchViewModel.topCornerRadius` 展开时为 0、闭合仍为 6，避免贴顶后面板与屏幕顶边之间露出两个背景三角。底部圆角仍为 24 / 14。
+4. **展开态顶部两角改方角（已撤回）**：曾把展开态顶部切点偏移设成 0、闭合仍为 6，理由是避免贴顶后面板与屏幕顶边之间露出两个背景三角。后来确认成熟参照实现两态共用同一条内凹构造、只是切点偏移不同（闭合 6 / 展开 19）：方角会把耳部涂黑、与物理刘海脱开，所以撤回；现在展开态取 19。判据是 y=t/2 的首个不透明像素——内凹在 `0.914t`、方角在 0、外凸圆弧在 `0.134t`。
 
 顺带把 `--selftest` 从 18 项扩到 23 项：新增「窗口比展开内容宽」「level = mainMenu+3」「collectionBehavior 含 all-spaces/full-screen-auxiliary」「闭合顶部圆角 6」「展开顶部圆角 0」，并把 WindowServer bounds 的校验从「容差 ±12/±8」收紧到 ±2、minY ≤ 1（先等 1.2s 让首次合成完成）。之后建立界面设计规范时，又加了第 24 项「视图层只用 DesignSystem token」（静态扫描，见「界面设计规范」一节）。
 
@@ -591,49 +599,46 @@ CI 的 verify 步骤除了跑注入模式，还会 `grep` 两件事：`geometry 
 
 **尺寸随内容**（窗口仍不 resize）：
 
-| 页面 | 内容自然尺寸（不含内边距） | chrome | 行间距 | 上下内边距 | 形状尺寸 |
-|---|---|---|---|---|---|
-| 首页 | 268 × 56（媒体行：封面 56） | 28 | 12 | 16 × 2 | **300 × 128** |
-| 文件架 | 216 × 32 / 72 / 112 / 140（按条目数 0–1 / 2 / 3 / ≥4） | 28 | 12 | 16 × 2 | **248 × 104 / 144 / 184 / 212** |
-| 计时器 | 196 × 15（占位一行正文） | 28 | 12 | 16 × 2 | **228 × 87** |
-| 播放器兼容 | 268 × 112（4 行 × 28pt，摘要 + 入口按钮） | 28 | 12 | 16 × 2 | **300 × 184** |
+| 页面 | 内容自然尺寸（不含内边距） | chrome | 行间距 | 左右内缩 | 上 / 下内边距 | 形状尺寸 |
+|---|---|---|---|---|---|---|
+| 首页 | 254 × 56（媒体行：封面 56） | 28 | 12 | 23 | 36 / 16 | **300 × 148** |
+| 文件架 | 202 × 32 / 72 / 112 / 140（按条目数 0–1 / 2 / 3 / ≥4） | 28 | 12 | 23 | 36 / 16 | **248 × 124 / 164 / 204 / 232** |
+| 计时器 | 182 × 15（占位一行正文） | 28 | 12 | 23 | 36 / 16 | **228 × 107** |
+| 播放器兼容 | 254 × 112（4 行 × 28pt，摘要 + 入口按钮） | 28 | 12 | 23 | 36 / 16 | **300 × 204** |
 
-`PageMetrics` 的换算没有中间档：`形状高 = chrome 28 + 间距 12 + 内容自然高 + 16×2`，只夹一个防止过小的下限（`28 + 12 + 16×2 = 72`）和一个封顶上限 640×212。窗口 = 最大页形状 300×212 + 16 超调 + 20 阴影 = **316×232**，切页只改绘制形状与命中矩形。
+左右内缩不是固定值，而是 `t + 4`（`PageMetrics.contentHorizontalInset`）：展开 t=19 → **23**，闭合 t=6 → 10。内容宽因此比旧版窄 14pt（268→254、216→202、196→182），**面板宽 300/248/228/300 保持不变**，让位的是内容而不是形状。顶部 36 是「硬件矩形下缘 32 + `contentGap` 4」，无刘海屏退回 16。
 
-**高度占比（三个独立口径，分母都是面板高）**：不再有把 chrome 与 padding 算进去的「内容区」。`PageMetrics.HeightBudget` 把面板高度拆成互不重叠的三桶，`selftest` 断言三者相加等于面板高，且占比合计 100%。
+`PageMetrics` 的换算没有中间档：`形状宽 = 内容自然宽 + 23×2`，`形状高 = 上内边距 36 + chrome 28 + 间距 12 + 内容自然高 + 下内边距 16`，只夹一个防止过小的下限（宽 200、高 92）和一个封顶上限 640×232。窗口 = 最大页形状 300×232 + 16 超调 + 20 阴影 = **316×252**，从创建到销毁都不 resize：**这是为动画连续性做的有意取舍**——宽度与高度逐帧插值，若窗口跟着 resize，spring 超调那几帧会被窗口边界平切、并引入坐标抖动；代价是页面比 300×232 小时，窗口里多出一圈透明区域（不绘制、不挡鼠标，闭合态窗口整体穿透）。切页只改绘制形状与命中矩形。
 
-| 页面 | 实际内容块 | chrome | padding + 间距 | 面板高 | 内容份额下限 30% |
-|---|---|---|---|---|---|
-| 首页 | 56 → **43.8%** | 28 → 21.9% | 44 → 34.4% | 128 | 过 |
-| 文件架（0–1 条 / 2 条 / 3 条 / ≥4 条） | 32 / 72 / 112 / 140 → **30.8% / 50.0% / 60.9% / 66.0%** | 28 → 26.9% / 19.4% / 15.2% / 13.2% | 44 → 42.3% / 30.6% / 23.9% / 20.8% | 104 / 144 / 184 / 212 | 过（最低 30.8%，刚过线） |
-| 计时器 | 15 → 17.2% | 28 → 32.2% | 44 → 50.6% | 87 | **豁免**（占位页，见下） |
-| 播放器兼容 | 112 → **60.9%** | 28 → 15.2% | 44 → 23.9% | 184 | 过 |
+**高度占比（四个独立口径，分母都是面板高）**：不再有把 chrome 与 padding 算进去的「内容区」。`PageMetrics.HeightBudget` 把面板高度拆成互不重叠的四个桶，`selftest` 断言四者相加等于面板高，且占比合计 100%。
 
-首页额外断言「实际内容块是三者中最大的一份」（43.8% > 34.4% > 21.9%）：媒体页的内容必须压过 chrome 和留白。旧版报的 80.6% 是旧口径（把 28pt chrome 和底部 padding 都算进内容区）算出来的，同时又说 chrome 19.4%，两边不自洽；旧版真实内容块只有 56/180 = 31.1%。
+| 页面 | 实际内容块 | chrome | 自有留白（padding + 间距） | 系统让位（safeTop − 16） | 面板高 | 30% 口径 |
+|---|---|---|---|---|---|---|
+| 首页 | 56 → **37.8%** | 28 → 18.9% | 44 → 29.7% | 20 → 13.5% | 148 | 内容 < 60pt → 改判固定开销 92 |
+| 文件架（0–1 / 2 / 3 / ≥4 条） | 32 / 72 / 112 / 140 → **25.8% / 43.9% / 54.9% / 60.3%** | 28 → 22.6% / 17.1% / 13.7% / 12.1% | 44 → 35.5% / 26.8% / 21.6% / 19.0% | 20 → 16.1% / 12.2% / 9.8% / 8.6% | 124 / 164 / 204 / 232 | 0–1 条走固定开销；2 条起 43.9% 起过线 |
+| 计时器 | 15 → **14.0%** | 28 → 26.2% | 44 → 41.1% | 20 → 18.7% | 107 | 内容 < 60pt → 改判固定开销 92 |
+| 播放器兼容 | 112 → **54.9%** | 28 → 13.7% | 44 → 21.6% | 20 → 9.8% | 204 | 过 |
 
-**每一页都生效的内容份额下限：30%**（`PageMetrics.minContentRatio`）。这条是「无效内容不能占一半以上」的量化口径，不是只对首页成立的特例：
+首页额外断言「实际内容块是四者中最大的一份」（37.8% > 29.7% > 18.9% > 13.5%）：媒体页的内容必须压过 chrome 和留白。旧版报的 80.6% 是旧口径（把 28pt chrome 和底部 padding 都算进内容区）算出来的，同时又说 chrome 19.4%，两边不自洽；旧版真实内容块只有 56/180 = 31.1%。
 
-- 固定骨架 = chrome 28 + 上下内边距 32 + 行间距 12 = **72pt**，任何一页都要先付这笔钱，而且它不承载任何内容；
-- 30% 反解出内容高度 ≈ 31pt，正好是**两条正文行高（15 × 2 = 30）**或**一个控件档位（32）**——一页的内容至少要顶得上两行字，低于这个量级，继续把面板加高只是在放大留白；
-- 取值 30% 而不是 40%：文件架（30.8%）的空状态虚线框是一个**真实可交互元素**、且已被控件阶梯钉死（`Control.lg` = 32），把阈值抬到 40% 只能靠把空状态框撑高来凑数，那是为了过门禁而造假内容。
+**内容份额的两条判据**（`PageMetrics.contentShareVerdict`）：
 
-**豁免页只有一个，写在断言里并逐页打印**（`PageMetrics.contentShareExemptions`，不是「默认放过」）：
+- 内容 ≥ 60pt：份额必须 ≥ 30%（`minContentRatio`）。30% 反解出内容高度 ≈ 31pt，正好是两条正文行高（15×2）或一个控件档位（32）；
+- 内容 < 60pt：30% 反解出的高度不足一个控件档位，继续加高只会放大留白，改判「总高 = 内容 + 固定开销」（36 + 28 + 12 + 16 = **92pt**），多压一分或乱留一分都会红。
 
-| 豁免页 | 份额 | 原因 |
-|---|---|---|
-| 计时器 | 17.2%（15/87） | 占位页：内容只有一行「后续接入」。72pt 骨架下份额上限是 15/(15+72) = 17.2%，把形状压到最小档 72pt 也只是把留白换成骨架，份额不会变好——要过线只能先有真实内容（倒计时读数 + 控制），属于后续实现，不是本轮尺寸问题 |
+计时器 14.0% 因此按第二条判据判：107 = 15 + 92，不达标的是比例、达标的是固定开销，逐页打印时两条都照实输出。
 
-`--selftest` 的输出（逐页报数，豁免带原因）：
+`--selftest` 的输出（逐页报数）：
 
 ```text
-[SHARE] 首页 内容 43.8% (56/128) ≥ 下限 30%
-[SHARE] 文件架 0 个 内容 30.8% (32/104) ≥ 下限 30%
-[SHARE] 计时器 内容 17.2% (15/87) 豁免：占位页：内容只有一行「后续接入」（15pt）。72pt 固定骨架下上限就是 17.2%，把形状压到最小档 72pt 也只是把留白换成骨架，份额不会变好
-[SHARE] 播放器兼容 内容 60.9% (112/184) ≥ 下限 30%
+[SHARE] 首页 内容 37.8% (56/148) ≥ 下限 30% 达标；内容 < 60pt，改判固定开销 92pt：总高 148 = 56 + 92 达标
+[SHARE] 文件架 0 个 内容 25.8% (32/124) < 下限 30% 不达标；内容 < 60pt，改判固定开销 92pt：总高 124 = 32 + 92 达标
+[SHARE] 计时器 内容 14.0% (15/107) < 下限 30% 不达标；内容 < 60pt，改判固定开销 92pt：总高 107 = 15 + 92 达标
+[SHARE] 播放器兼容 内容 54.9% (112/204) ≥ 下限 30% 达标
 [SELFTEST] PASS  every page keeps content above 30% of panel height  (…)
 ```
 
-**四边内边距**：整块只挂一个 `.padding(DesignSystem.Spacing.lg)`（16pt）。渲染图实测：首页封面左缘距面板左 16.0pt、封面底距面板底 16.0pt；chrome 行图标字形距面板左 22.0pt（16pt padding + 28pt 命中区里 20pt 视觉块内缩 4pt + 图标再内缩 2pt）。
+**内边距**：竖向仍是 `Spacing.lg` 16，顶部由 `PageMetrics.topInset`（有刘海 36 = 硬件 32 + `contentGap` 4）覆盖；左右改由 `contentHorizontalInset = t + 4` 驱动（闭合 10 / 展开 23），不再固定 16。渲染图实测（展开）：首页最早内容像素距面板左 31.5pt = 侧壁 27.0 + **4.5pt 净间隙**；文件架 0 条 10.0pt、≥2 条 7.0pt（行内自带留白）；chrome 行图标字形在 23pt 内缩之后再按命中区内缩，同样不再贴侧壁。
 
 **控件尺寸 token**（`DesignSystem.Control`，阶梯 20/24/28/32，视图只引用档位）：`xs 20` = Tab 选中色块的视觉尺寸；`sm 24` = 上一首/下一首命中区；`md 28` = 唯一一行 chrome、Tab 命中区（透明扩边，图标仍是 16、色块仍是 20，相邻命中区间隙 4pt 不重叠）、播放大按钮直径；`lg 32` = 文件架行高与空状态区高度。图标 16（`Size.icon`）、文件图标 20（`Size.fileIcon`）、封面 56（`Size.cover`）、封面音符 24（`Size.coverGlyph`）、封面圆角 8（`Radius.medium`）。
 
@@ -1012,6 +1017,14 @@ shasum -a 256 /abs/build/Brimio.app/Contents/MacOS/Brimio /abs/scratch/out/Produ
 
 实现上踩到一个坑：`URL.resourceValues(forKeys: [.isRegularFileKey])` 对**已删除/已移走**的路径仍返回 `1`（同一路径 `FileManager.fileExists` 为 false），导致死链不消失。已改为 `FileManager.attributesOfItem` + `attributes[.type] == .typeRegular` 判活，`makeItem` 与 `pruneMissing` 共用这一条。
 
+### 拖出源、落点与拖入滚动（本轮接线）
+
+- **拖出只写 `.fileURL`**，与拖入同类型；不用 SwiftUI `.onDrag`——那套回调只有 provider，拿不到会话结束时的 move/copy。改为 `NSViewRepresentable` 挂一个 `NSDraggingSource`，在 `draggingSession(_:endedAt:operation:)` 里把最终 operation 原样交给 `applyShelfDragOut`。默认只允许 copy，按住 ⌘ 才允许 move（与 DESIGN 的「不静默移动用户文件」一致）。
+- **拖出可断言**：`NSDraggingSession` 无法在 selftest 里构造，所以把「会话结束」收成 `ShelfDragOutSource.finished(operation:)` 一个方法，AppKit 回调只做一行转发。自测断言：粘贴板只有 `public.file-url`、无修饰键 = copy / ⌘ = move、`.copy` 后条目和原文件都在、`.move` 后条目立即消失。
+- **落点必须在形状内**：拖动期间整窗 `setInteractive(true)`，透明圆角/内凹肩上的 drop 同样会进 hosting view。`validateDrop` 除类型外还要求 `NotchShape.contains(location)`，否则「拖到面板外的空白再松手」也会被当成有效落点。自测断言角落 `(1,1)` 拒绝、中心接受、非 `.fileURL` 拒绝。
+- **拖入自动滚动**：`dropUpdated` 把指针位置推进 `NotchViewModel.fileDropLocation`，文件架用 `ScrollViewReader.scrollTo` 在视口上下 1/2 行内各走一行；中间区域不滚，**不加常驻滚动条**（仍是系统 overlay）。滚轮/触控板手感仍需人工验收，见下一节。
+- **反向动画（数据，不修）**：`--animate-probe` 增加「展开 100ms 后立即收起」的尺寸序列。实测转向点滞后 27ms（状态变更等下一个 transaction）、转向后无平台期（0ms）、无二次反向（jitter=0）、速度比 0.78 未构成断点；转向前的 +7.6pt 属于滞后窗口内仍在进行的展开动画。速度继承（曲线从 0 重新起动）本轮只记录、不修，探针断言只卡平台期与抖动。
+
 ### 离屏渲染
 
 `ImageRenderer` 不支持 `ScrollView`（画成黄色/空白占位），所以 `--render` 时把 `FileShelfRendering.isOffscreen` 置 true，列表改用同尺寸 `.clipped()` 容器；运行时仍是 `ScrollView`。这条开关默认 `false`，全仓唯一的赋值点在 `main.swift` 的 `renderSnapshots` 里（`--render` 分支），正常运行路径碰不到它。
@@ -1033,8 +1046,10 @@ shasum -a 256 /abs/build/Brimio.app/Contents/MacOS/Brimio /abs/scratch/out/Produ
 | 3 | 按住 ⌘ 把列表里的某条拖到桌面，松手 | 该条**立即**从列表消失（move 语义）；桌面上出现该文件，Finder 原路径已不存在 | 条目还在（残留死链）/ 原文件仍在原处但桌上多一份（成了 copy）/ 两者都不在（文件丢失，最严重）——任一即 FAIL |
 | 4 | 在 Finder 里删掉一个已入架的文件（移到废纸篓即可），回到面板重新展开或切到「文件架」 | 该条自动消失，列表数量减 1，其余条目不动 | 该条仍在（点它是死链）/ 整表被清空 / 其余条目顺序被打乱——任一即 FAIL |
 | 5 | 拖一个文件从刘海上方**经过**但不停留（不在刘海上悬停），移开后再看 | 不展开；闭合态保持原样，鼠标离开后 300ms 内不延时展开 | 经过瞬间就展开（说明拖动态把 hover 打开逻辑带起来了）/ 移开后仍然展开——任一即 FAIL |
+| 6 | 第 5 个文件拖进文件架后**不松手**，把指针停在列表下缘 | 列表自动向下滚一行，露出后面的条目；指针移到列表中间就停止滚动；右侧不出现常驻滚动条 | 边缘不滚（`dropUpdated` 没把位置推给文件架）/ 一直滚不停 / 出现常驻滚动条——任一即 FAIL |
+| 7 | 拖文件到面板左下/右下的**透明圆角外**松手 | 不加入文件架，面板不切页（落点被形状路径拒绝） | 圆角外的空白也能落进文件架（说明 `validateDrop` 只看了类型，没看形状） |
 
-第 3、4 条对应 `--selftest` 里已自动化的死链断言（`moving an entry out removes it immediately`、`deleting outside the app removes the entry on the next user action`）；这里用手真实操作复核一遍，因为自动化只驱动了 `FileShelfStore`，没有驱动真实的 ⌘ 修饰键与 Finder 删除动作。
+第 3、4、6、7 条已有对应的自动断言（`move drag-out removes the entry immediately`、`deleting outside the app removes the entry on the next user action`、`drag auto-scroll steps one row at the viewport edges only`、`drop is accepted only inside the notch path`）。这里仍用手真实操作复核一遍：自动化只驱动了 `FileShelfStore` 与拖出源的结束出口，没有驱动真实的 ⌘ 修饰键、Finder 会话与指针事件流。
 
 界面文案只写已实现的行为：空架「暂无文件，拖入后在这里显示。」——没有「自动整理」「云端同步」「过期提醒」这类未验证承诺。
 
