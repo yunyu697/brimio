@@ -120,6 +120,24 @@ enum FileShelfLayout {
         default: return viewportHeight
         }
     }
+
+    /// 拖入自动滚动的一步：指针在视口上/下 1/2 行内时，把滚动目标移动一行。
+    ///
+    /// 只暴露「下一步滚到哪一行」，不读滚动偏移（SwiftUI 没有公开 API）：
+    /// 指针每移动一次 `dropUpdated` 就推进一步，连续停在边缘就连续走行。
+    /// 中间区域返回 nil（不滚动），避免拖过一行就整页跳。
+    static func autoScrollStep(
+        localY: CGFloat,
+        viewportHeight: CGFloat,
+        currentIndex: Int,
+        count: Int
+    ) -> Int? {
+        guard count > 1, viewportHeight > 0, localY >= 0, localY <= viewportHeight else { return nil }
+        let edge = rowHeight / 2
+        if localY < edge, currentIndex > 0 { return currentIndex - 1 }
+        if localY > viewportHeight - edge, currentIndex < count - 1 { return currentIndex + 1 }
+        return nil
+    }
 }
 
 /// 离屏渲染开关（只在 `--render` 里置位）。
@@ -133,15 +151,28 @@ enum FileShelfRendering {
 
 /// hover 状态放在引用类型里：`@State` 依赖 SwiftUI 宏，本仓库的 SwiftPM
 /// 工具链插件在这台机器上不可用，用 `ObservableObject` 保持同样的语义。
+///
+/// 顺带承载两个**不需要触发重绘**的中间量：视口 frame 与自动滚动行。
+/// 它们只在 drop 事件里读写，用普通存储属性（非 `@Published`），
+/// 避免几何回调写出新的视图更新。
 @MainActor
 final class ShelfHoverState: ObservableObject {
     @Published var id: String?
+    /// 视口在根视图坐标系里的 frame（自动滚动换算用）。
+    var viewportFrame: CGRect = .zero
+    /// 自动滚动当前行：只在拖入过程中由 `autoScrollStep` 推进。
+    var dropScrollIndex = 0
 }
 
 /// 文件架正文：空态虚线框，或有文件时的一屏三行（第 4 行起滚动）。
 struct FileShelfView: View {
     let items: [ShelfItem]
     let onRemove: (ShelfItem) -> Void
+    /// 拖出结束：AppKit 给出最终 operation（move 删条目 / copy 保留）。
+    let onDragOut: (URL, NSDragOperation) -> Void
+    /// 拖入指针位置（根视图坐标）；nil 表示当前没有文件拖动。
+    /// 只用来在视口上下边缘触发自动滚动，不参与任何尺寸或命中判定。
+    let dropLocation: CGPoint?
 
     @StateObject private var hover = ShelfHoverState()
 
@@ -155,13 +186,49 @@ struct FileShelfView: View {
                     .frame(height: FileShelfLayout.contentHeight(count: items.count), alignment: .top)
                     .clipped()
             } else {
-                ScrollView(.vertical, showsIndicators: true) {
-                    rows
+                ScrollViewReader { proxy in
+                    ScrollView(.vertical, showsIndicators: true) {
+                        rows
+                    }
+                    .background(viewportReader)
+                    // 指针每移动一次就重新判一次：停在上下边缘时连续走行，
+                    // 中间区域不动。手势数据来自根视图的 `FileDropDelegate`。
+                    .onChange(of: dropLocation) { location in
+                        autoScroll(to: location, proxy: proxy)
+                    }
                 }
             }
         }
         .frame(height: FileShelfLayout.contentHeight(count: items.count), alignment: .top)
         .frame(maxWidth: .infinity, alignment: .leading)
+    }
+
+    private var viewportReader: some View {
+        GeometryReader { geometry in
+            Color.clear.preference(
+                key: ShelfViewportKey.self,
+                value: geometry.frame(in: .named(NotchCoordinateSpace.content))
+            )
+        }
+        .onPreferenceChange(ShelfViewportKey.self) { hover.viewportFrame = $0 }
+    }
+
+    /// 拖入自动滚动：只调 `scrollTo`，不显示常驻滚动条。
+    private func autoScroll(to location: CGPoint?, proxy: ScrollViewProxy) {
+        let viewport = hover.viewportFrame
+        guard let location, !items.isEmpty, viewport.height > 0 else { return }
+        let localY = location.y - viewport.minY
+        guard localY >= 0, localY <= viewport.height else { return }
+        guard let next = FileShelfLayout.autoScrollStep(
+            localY: localY,
+            viewportHeight: viewport.height,
+            currentIndex: min(hover.dropScrollIndex, items.count - 1),
+            count: items.count
+        ) else { return }
+        // 向上滚时把目标行贴顶，向下滚时贴底：两个方向都只走一行。
+        let anchor: UnitPoint = next < hover.dropScrollIndex ? .top : .bottom
+        hover.dropScrollIndex = next
+        proxy.scrollTo(items[next].id, anchor: anchor)
     }
 
     private var emptyState: some View {
@@ -206,6 +273,16 @@ struct FileShelfView: View {
         }
         .frame(height: FileShelfLayout.rowHeight)
         .contentShape(Rectangle())
+        // 拖出：行上盖一层 AppKit 视图发起真实的 `NSDraggingSession`。
+        // 不用 SwiftUI `.onDrag`：那套拿不到会话结束时的 move/copy（见 `ShelfDragOutSource`）。
+        // 离屏渲染（ImageRenderer）不实例化 AppKit 视图，否则会画占位块。
+        .overlay {
+            if !FileShelfRendering.isOffscreen {
+                FileShelfDragOutHandle(url: item.url) { operation in
+                    onDragOut(item.url, operation)
+                }
+            }
+        }
         .onHover { inside in
             if inside {
                 hover.id = item.id
@@ -250,16 +327,42 @@ struct FileShelfView: View {
 /// 多个文件先收齐再一次性加入，避免逐条插入让顺序反转。
 struct FileDropDelegate: DropDelegate {
     let onFiles: ([URL]) -> Void
+    /// 指针位置（根视图坐标），用于文件架边缘自动滚动；离开/松手时推 nil。
+    var onLocation: ((CGPoint?) -> Void)?
+    /// 形状内判定：拖动期间整窗可交互，透明边缘上的 drop 也会进 hosting view，
+    /// 必须按路径判定落点，否则「拖到面板外的圆角空白」也会被当成有效落点。
+    var shapeContains: ((CGPoint) -> Bool)?
+
+    /// 唯一的落点判定，纯函数，自测直接调用。
+    static func accepts(
+        hasFileURL: Bool,
+        location: CGPoint,
+        shapeContains: ((CGPoint) -> Bool)?
+    ) -> Bool {
+        guard hasFileURL else { return false }
+        guard let shapeContains else { return true }
+        return shapeContains(location)
+    }
 
     func validateDrop(info: DropInfo) -> Bool {
-        info.hasItemsConforming(to: [.fileURL])
+        Self.accepts(
+            hasFileURL: info.hasItemsConforming(to: [.fileURL]),
+            location: info.location,
+            shapeContains: shapeContains
+        )
     }
 
     func dropUpdated(info: DropInfo) -> DropProposal? {
-        DropProposal(operation: .copy)
+        onLocation?(info.location)
+        return DropProposal(operation: .copy)
+    }
+
+    func dropExited(info: DropInfo) {
+        onLocation?(nil)
     }
 
     func performDrop(info: DropInfo) -> Bool {
+        onLocation?(nil)
         let providers = info.itemProviders(for: [.fileURL])
         guard !providers.isEmpty else { return false }
 
@@ -280,4 +383,131 @@ struct FileDropDelegate: DropDelegate {
         group.notify(queue: .main) { onFiles(urls) }
         return true
     }
+}
+
+/// 文件架视口在根视图坐标系里的 frame（自动滚动换算用）。
+private struct ShelfViewportKey: PreferenceKey {
+    static var defaultValue: CGRect = .zero
+    static func reduce(value: inout CGRect, nextValue: () -> CGRect) {
+        value = nextValue()
+    }
+}
+
+/// 拖出源：只提供 `.fileURL`（与拖入同类型，避免对方只认 `NSURL` 时反向失败）。
+///
+/// 为什么不用 SwiftUI `.onDrag`：它的回调只给 provider，拖动会话结束时没有
+/// 「最终是 move 还是 copy」这个判据，`applyShelfDragOut` 就无从判定条目该不该消失。
+/// 这里的 `NSDraggingSource` 在 `draggingSession(_:endedAt:operation:)` 里拿到最终
+/// operation，原样回调给 `applyShelfDragOut`。
+struct FileShelfDragOutHandle: NSViewRepresentable {
+    let url: URL
+    let onEnded: (NSDragOperation) -> Void
+
+    /// 拖出只写一个类型：`fileURL`，值为绝对路径的 `absoluteString`。
+    static func pasteboardItem(for url: URL) -> NSPasteboardItem {
+        let item = NSPasteboardItem()
+        item.setString(url.absoluteString, forType: .fileURL)
+        return item
+    }
+
+    func makeNSView(context: Context) -> ShelfDragOutView {
+        let view = ShelfDragOutView()
+        view.url = url
+        view.onEnded = onEnded
+        return view
+    }
+
+    func updateNSView(_ view: ShelfDragOutView, context: Context) {
+        view.url = url
+        view.onEnded = onEnded
+    }
+}
+
+/// 行上的 AppKit 拖出视图：按下即发起一次拖动会话。
+///
+/// 行尾 48pt（40pt ×/大小槽位 + 8pt 间距）不参与命中，让 SwiftUI 的 × 按钮照常可点。
+final class ShelfDragOutView: NSView {
+    var url: URL?
+    var onEnded: ((NSDragOperation) -> Void)?
+
+    private var activeSource: ShelfDragOutSource?
+    private static let trailingReserved: CGFloat =
+        FileShelfLayout.sizeSlotWidth + DesignSystem.Spacing.sm
+
+    override func hitTest(_ point: NSPoint) -> NSView? {
+        guard let superview else { return super.hitTest(point) }
+        let local = convert(point, from: superview)
+        guard local.x < bounds.maxX - Self.trailingReserved else { return nil }
+        return super.hitTest(point)
+    }
+
+    override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
+
+    override func mouseDown(with event: NSEvent) {
+        guard let url else { return }
+        let location = convert(event.locationInWindow, from: nil)
+        let dragItem = NSDraggingItem(
+            pasteboardWriter: FileShelfDragOutHandle.pasteboardItem(for: url)
+        )
+        let icon = NSWorkspace.shared.icon(forFile: url.path)
+        let side = DesignSystem.Control.lg
+        icon.size = NSSize(width: side, height: side)
+        dragItem.setDraggingFrame(
+            NSRect(x: location.x - side / 2, y: location.y - side / 2, width: side, height: side),
+            contents: icon
+        )
+        let source = ShelfDragOutSource(url: url) { [weak self] operation in
+            self?.activeSource = nil
+            self?.onEnded?(operation)
+        }
+        // 会话期间必须持有 source，否则会话对象被提前释放，endedAt 回调丢失。
+        activeSource = source
+        beginDraggingSession(with: [dragItem], event: event, source: source)
+    }
+}
+
+/// 拖动会话结束的唯一出口。
+///
+/// `finished(operation:)` 与 AppKit 回调分开：AppKit 的 `NSDraggingSession` 无法在
+/// 自测里构造，把判定逻辑收在一个可直接调用的方法上，selftest 才能真的断言
+/// 「move 删条目 / copy 保留」。
+final class ShelfDragOutSource: NSObject, NSDraggingSource {
+    let url: URL
+    private let onEnded: (NSDragOperation) -> Void
+
+    /// 默认只允许 copy（不改动用户文件位置）；按住 ⌘ 才允许 move。
+    /// 与 DESIGN「默认 copy、⌘ 才 move」一致。
+    static func operations(for modifiers: NSEvent.ModifierFlags) -> NSDragOperation {
+        modifiers.contains(.command) ? [.move] : [.copy]
+    }
+
+    var allowedOperations: NSDragOperation {
+        ShelfDragOutSource.operations(for: NSEvent.modifierFlags)
+    }
+
+    init(url: URL, onEnded: @escaping (NSDragOperation) -> Void) {
+        self.url = url
+        self.onEnded = onEnded
+    }
+
+    func finished(operation: NSDragOperation) {
+        onEnded(operation)
+    }
+
+    func draggingSession(
+        _ session: NSDraggingSession,
+        sourceOperationMaskFor context: NSDraggingContext
+    ) -> NSDragOperation {
+        allowedOperations
+    }
+
+    func draggingSession(
+        _ session: NSDraggingSession,
+        endedAt screenPoint: NSPoint,
+        operation: NSDragOperation
+    ) {
+        finished(operation: operation)
+    }
+
+    func ignoreModifierKeys(for session: NSDraggingSession) -> Bool { false }
 }

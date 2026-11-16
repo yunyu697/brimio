@@ -42,14 +42,16 @@ enum ExpandedItem: String, CaseIterable, Identifiable, Equatable {
     }
 
     /// 内容区宽度：设计声明的阅读宽度，决定面板有多宽。
+    /// 面板宽 = 内容宽 + 2×`openContentHorizontalInset`(23)；顶部 t=19 后内容让位 14pt、
+    /// 面板宽保持 300 / 248 / 228 / 300 不变。
     private var contentWidth: CGFloat {
         switch self {
-        // 首页：封面 56 + 间距 8 + 文字 112 + 间距 8 + 控制 84 = 268
-        case .home: return 268
-        case .files: return 216
-        case .timer: return 196
+        // 首页：封面 56 + 间距 8 + 文字 98 + 间距 8 + 控制 84 = 254
+        case .home: return 254
+        case .files: return 202
+        case .timer: return 182
         // 播放器兼容：每行「名字 + 开关 + 一行权限/收益说明」需要更宽的行宽。
-        case .players: return 268
+        case .players: return 254
         }
     }
 
@@ -65,15 +67,58 @@ enum ExpandedItem: String, CaseIterable, Identifiable, Equatable {
         // 计时器：占位一行正文 15
         case .timer:
             return DesignSystem.Typography.body.lineHeight
-        // 播放器兼容：固定高度内滚动（4 行 × 28pt）。
-        // chrome+间距+四边内边距是 72pt，212 上限留给内容 140，取 112 保证不被夹住。
+        // 播放器兼容：摘要两行 + 入口按钮（0 个第三方已开启）= 74。
+        // 子态随列表行增长，由 `PageMetrics.playersContentHeight(enabledCount:)` 按行算，不写死槽位。
         case .players:
-            return DesignSystem.Control.md * 4
+            return PageMetrics.playersContentHeight(enabledCount: 0)
         }
     }
 
     /// 该页的形状尺寸（chrome + 内容 + 统一内边距，夹在上下限内）。
     var shapeSize: CGSize { PageMetrics.shapeSize(for: self) }
+}
+
+/// 首页四种内容版式（SPEC §9.2）。同页不同子态高度不同（§7.6），
+/// 所以版式必须是一个显式状态，而不是「共用 56 槽位 + 垂直居中」。
+enum HomeLayout: String, Equatable {
+    case playing
+    case presenceOnly
+    case permissionDenied
+    case empty
+
+    /// 唯一判定顺序：视图分支与高度换算共用这一处，避免两处 if 链漂移。
+    /// IOPM 状态压过授权引导（有状态可显示时不必优先劝授权），曲目压过状态。
+    static func resolve(media: MediaSnapshot, permission: MediaPermission) -> HomeLayout {
+        if media.isPresenceOnly { return .presenceOnly }
+        if media.hasTrack { return .playing }
+        if permission == .denied { return .permissionDenied }
+        return .empty
+    }
+}
+
+/// 首页文案表（SPEC §7.7.5）：**行数档位在这里声明**，运行时不得量行数回写高度。
+///
+/// 当前真实文案在规范宽度（空态 254 / 拒绝态 206）下都是单行档 → H 107 / 120。
+/// 文案加长到放不下时，把对应档改成 2（C 15 → 30，H → 122）；`--render-baseline`
+/// 的 text-fit 会同时核对「声明档位 == 实际渲染行数」。
+enum HomeCopyTable {
+    static let emptyText = "暂无播放，先在 Music 里放一首"
+    static let deniedText = "允许控制音乐，去系统设置开启"
+    static let presenceHint = "用键盘媒体键 ⏮ ⏯ ⏭ 控制"
+
+    /// 单行 = 1，双行 = 2。只允许 1 或 2（3 行禁止，§7.7.7）。
+    static let emptyLines = 1
+    static let deniedLines = 1
+
+    /// 空态说明块高：15 × 行数档（单行 15 / 双行 30）。
+    static var emptyBlockHeight: CGFloat {
+        DesignSystem.Typography.body.lineHeight * CGFloat(emptyLines)
+    }
+
+    /// 被拒行容器高：max(28, 15 × 行数档)（单行 28 / 双行 30）。
+    static var deniedRowHeight: CGFloat {
+        max(DesignSystem.Control.md, DesignSystem.Typography.body.lineHeight * CGFloat(deniedLines))
+    }
 }
 
 /// 展开态尺寸的统一换算：内容尺寸 → 形状尺寸。
@@ -84,91 +129,188 @@ enum ExpandedItem: String, CaseIterable, Identifiable, Equatable {
 enum PageMetrics {
     /// 统一内边距，四边一致（复用间距阶梯的 lg = 16）。
     /// 视图层整块 `.padding(contentPadding)`，不再分别写 top/horizontal。
+    /// **只用于竖向**；左右改由 `contentHorizontalInset(topTangentOffset:)` 驱动。
     static let contentPadding = DesignSystem.Spacing.lg
+
+    /// 内容左右内缩：**由顶部切点偏移 t 驱动**（闭合 6 / 展开 19）+ 侧壁净间隙。
+    ///
+    /// 参照实现把 `top` 复用为内容左右内缩；我们保留一个明确的净间隙
+    /// （`NotchHardware.contentGap` = 4pt），保证内容盒始终落在侧壁内侧、不贴壁。
+    /// 旧实现固定 16，展开 t=19 时内容被侧壁裁掉 3pt（实测内容像素贴到侧壁）。
+    static func contentHorizontalInset(topTangentOffset: CGFloat) -> CGFloat {
+        topTangentOffset + NotchHardware.contentGap
+    }
+
+    /// 展开态左右内缩：19 + 4 = **23**。面板宽 = 内容宽 + 2×23（宽度不变，内容让位）。
+    static var openContentHorizontalInset: CGFloat {
+        contentHorizontalInset(topTangentOffset: ScreenGeometry.cornerRadiusInsets.opened.top)
+    }
 
     /// 唯一一行 chrome 的高度：28pt（Tab 图标行，标题与状态文字都已删除）。
     static let chromeHeight = DesignSystem.Control.md
     /// chrome 行与内容区之间的间距（用间距而不是分隔线分组）。
     static let rowSpacing = DesignSystem.Spacing.md
 
-    /// 一页的高度预算：三个互不重叠的桶，相加正好等于面板高度。
+    /// 顶部内边距：由 `NotchHardware.topInset(for:)` 从系统信号算出后注入，
+    /// 视图与尺寸换算共用这一个值（默认等于统一内边距）。
+    /// 有刘海时 = 硬件矩形下缘 + `contentGap`，让整块内容落到硬件之下。
+    private(set) static var topInset = contentPadding
+
+    static func configure(topInset value: CGFloat) {
+        topInset = max(contentPadding, value)
+    }
+
+    /// 一页的高度预算：四个互不重叠的桶，相加正好等于面板高度。
     ///
     /// 旧的口径把 chrome 与底部 padding 也算进「内容区」，报出 80.6% 的同时又说
-    /// chrome 占 19.4%，自相矛盾。这里拆成三个独立数字，分母都是面板总高。
+    /// chrome 占 19.4%，自相矛盾。这里拆成独立数字，分母都是面板总高。
+    /// 系统让位单列：它是刘海硬件带挤出来的高度，不是设计留白，
+    /// 否则有刘海的机器上「内容是不是最大的一块」会被硬件带直接判红。
     struct HeightBudget {
         /// 实际内容块高度（首页媒体行 / 文件架空状态框 / 计时器常驻行）。
         let content: CGFloat
         /// 唯一一行 chrome。
         let chrome: CGFloat
-        /// 上下内边距 + chrome 与内容之间的间距。
+        /// 自有留白：四边内边距 + chrome 与内容之间的间距。
         let overhead: CGFloat
+        /// 系统让位：顶部内边距超出统一内边距的部分（有刘海时 20，无刘海时 0）。
+        let clearance: CGFloat
 
-        var total: CGFloat { content + chrome + overhead }
+        var total: CGFloat { content + chrome + overhead + clearance }
         var contentRatio: Double { Double(content / total) }
         var chromeRatio: Double { Double(chrome / total) }
         var overheadRatio: Double { Double(overhead / total) }
+        var clearanceRatio: Double { Double(clearance / total) }
     }
 
-    static func heightBudget(for item: ExpandedItem, shelfCount: Int = 0) -> HeightBudget {
+    static func heightBudget(
+        for item: ExpandedItem,
+        shelfCount: Int = 0,
+        home: HomeLayout = .playing,
+        playersEnabled: Int = 0
+    ) -> HeightBudget {
         HeightBudget(
-            content: contentHeight(for: item, shelfCount: shelfCount),
+            content: contentHeight(for: item, shelfCount: shelfCount, home: home, playersEnabled: playersEnabled),
             chrome: chromeHeight,
-            overhead: contentPadding * 2 + rowSpacing
+            overhead: contentPadding * 2 + rowSpacing,
+            clearance: max(0, topInset - contentPadding)
         )
     }
 
-    /// 内容高度：文件架按条目数变化（0/1、2、3、≥4 四档），其余页取自然高度。
-    static func contentHeight(for item: ExpandedItem, shelfCount: Int = 0) -> CGFloat {
-        guard item == .files else { return item.contentHeight }
-        return FileShelfLayout.contentHeight(count: shelfCount)
+    /// 首页内容高：**只按 `HomeCopyTable` 的声明档位算**，不量行数（SPEC §7.7.5）。
+    static func homeContentHeight(_ layout: HomeLayout) -> CGFloat {
+        switch layout {
+        case .playing:
+            return DesignSystem.Size.cover            // 56 → H 148
+        case .presenceOnly:
+            return DesignSystem.Control.md            // 28 → H 120，恒单行
+        case .permissionDenied:
+            return HomeCopyTable.deniedRowHeight      // 28 / 30 → H 120 / 122
+        case .empty:
+            return HomeCopyTable.emptyBlockHeight     // 15 / 30 → H 107 / 122
+        }
     }
 
-    // MARK: - 内容份额下限（每一页都生效）
-
-    /// 内容块占面板高度的下限：**30%**。
+    /// 设置页内容高（SPEC §8.5）：摘要两行 15+4+15 + 可选列表 + 12 + 入口按钮 28。
     ///
-    /// 固定骨架 = chrome 28 + 上下内边距 32 + 行间距 12 = 72pt，任何一页都要先付这笔钱，
-    /// 它不承载任何内容。30% 折算成内容高度约 31pt，正好等于「两条正文行高（15×2）」
-    /// 或一个控件档位（32）——低于这个量级，继续把面板加高只是在放大留白，
-    /// 也就是产品原则里的「无效内容不能占一半以上」的量化口径。
+    /// 列表只在有已开启的第三方时出现：1 行 = 8+20，2 行 = 8+20+8+20（第 2 行折叠「另有 N 个」）。
+    /// 于是 C = 74 / 102 / 130，H = 92 + C = **166 / 194 / 222**。
+    static func playersContentHeight(enabledCount: Int) -> CGFloat {
+        let rows = min(max(enabledCount, 0), 2)
+        let list: CGFloat = rows == 0
+            ? 0
+            : DesignSystem.Spacing.sm
+                + DesignSystem.Control.xs * CGFloat(rows)
+                + DesignSystem.Spacing.sm * CGFloat(rows - 1)
+        return DesignSystem.Typography.body.lineHeight * 2
+            + DesignSystem.Spacing.xs
+            + list
+            + DesignSystem.Spacing.md
+            + DesignSystem.Control.md
+    }
+
+    /// 内容高度：文件架按条目数、首页按版式、设置页按已开启个数；计时器取自然高度。
+    /// 每个分支都只做「行高求和」，没有声明槽位、没有 Spacer、没有按比例分配。
+    static func contentHeight(
+        for item: ExpandedItem,
+        shelfCount: Int = 0,
+        home: HomeLayout = .playing,
+        playersEnabled: Int = 0
+    ) -> CGFloat {
+        switch item {
+        case .files:
+            return FileShelfLayout.contentHeight(count: shelfCount)
+        case .home:
+            return homeContentHeight(home)
+        case .players:
+            return playersContentHeight(enabledCount: playersEnabled)
+        case .timer:
+            return item.contentHeight
+        }
+    }
+
+    // MARK: - 内容份额下限
+
+    /// 份额下限适用的内容高度门槛：内容 **≥ 60pt** 的页面才用 30% 口径。
+    ///
+    /// 低于 60pt 的页面，30% 反解出的高度不足一个控件档位，继续加高只会放大留白。
+    /// 这类页面改用「固定开销不随内容增长」这条约束（见 `fixedOverhead`）：
+    /// 断言真实总高 == 内容 + 固定开销，多压一分或者多留一分都会红。
+    static let ratioFloorContentHeight: CGFloat = 60
+
+    /// 内容块占面板高度的下限：**30%**，只对内容 ≥ 60pt 的页面生效。
     static let minContentRatio: Double = 0.30
 
-    /// 允许低于下限的页面。豁免必须写在这里（而不是在断言里悄悄跳过），
-    /// `--selftest` 会逐页打印份额并把豁免原因一起打出来。
-    struct ContentShareExemption {
-        let item: ExpandedItem
-        let reason: String
+    /// 固定开销：顶部内边距 + chrome + 行间距 + 底部内边距。
+    /// 有刘海时 = 36 + 28 + 12 + 16 = **92**，不随内容变化。
+    static var fixedOverhead: CGFloat {
+        topInset + chromeHeight + rowSpacing + contentPadding
     }
 
-    static let contentShareExemptions: [ContentShareExemption] = [
-        ContentShareExemption(
-            item: .timer,
-            reason: "占位页：内容只有一行「后续接入」（15pt）。72pt 固定骨架下上限就是 17.2%，"
-                + "把形状压到最小档 72pt 也只是把留白换成骨架，份额不会变好"
-        ),
-    ]
+    enum ContentShareRule {
+        /// 内容 ≥ 60pt：份额必须 ≥ 30%。
+        case ratioFloor
+        /// 内容 < 60pt：30% 不适用，改判「总高 = 内容 + 固定开销」。
+        case fixedOverhead
+    }
 
     struct ContentShareVerdict {
-        let ratio: Double
+        let rule: ContentShareRule
         let content: CGFloat
         let total: CGFloat
-        /// 非 nil 表示这一页被显式豁免，值为原因。
-        let exemption: String?
+        let overhead: CGFloat
 
-        var passes: Bool { ratio >= minContentRatio || exemption != nil }
+        var ratio: Double { total > 0 ? content / total : 0 }
+        /// 30% 这一问的真实答案。固定开销口径下也照实输出，不做掩盖。
+        var meetsRatioFloor: Bool { ratio >= minContentRatio }
+        /// 固定开销是否一分没涨：总高 − 内容 == 固定开销。
+        var overheadIsFixed: Bool { abs(total - content - overhead) < 0.01 }
+
+        var passes: Bool {
+            switch rule {
+            case .ratioFloor: return meetsRatioFloor
+            case .fixedOverhead: return overheadIsFixed
+            }
+        }
     }
 
-    static func contentShareVerdict(for item: ExpandedItem, shelfCount: Int = 0) -> ContentShareVerdict {
-        let budget = heightBudget(for: item, shelfCount: shelfCount)
+    static func contentShareVerdict(
+        for item: ExpandedItem,
+        shelfCount: Int = 0,
+        home: HomeLayout = .playing,
+        playersEnabled: Int = 0
+    ) -> ContentShareVerdict {
+        let budget = heightBudget(for: item, shelfCount: shelfCount, home: home, playersEnabled: playersEnabled)
         return ContentShareVerdict(
-            ratio: budget.contentRatio,
+            rule: budget.content >= ratioFloorContentHeight ? .ratioFloor : .fixedOverhead,
             content: budget.content,
-            total: budget.total,
-            exemption: contentShareExemptions.first { $0.item == item }?.reason
+            total: shapeSize(for: item, shelfCount: shelfCount, home: home, playersEnabled: playersEnabled).height,
+            overhead: fixedOverhead
         )
     }
 
-    /// 一行报告：`首页 内容 43.8% (56/128) ≥ 下限 30%`；豁免页尾巴上带原因。
+    /// 一行报告：达标就写「≥ 下限 30% 达标」，不达标就写「< 下限 30% 不达标」，
+    /// 固定开销口径再追加真实拆解（总高 = 内容 + 固定开销）。
     static func contentShareReport(for item: ExpandedItem, shelfCount: Int = 0) -> String {
         let verdict = contentShareVerdict(for: item, shelfCount: shelfCount)
         let label = item == .files ? "文件架 \(shelfCount) 个" : item.title
@@ -176,30 +318,53 @@ enum PageMetrics {
             format: "%@ 内容 %.1f%% (%d/%d)",
             label, verdict.ratio * 100, Int(verdict.content), Int(verdict.total)
         )
-        if let exemption = verdict.exemption {
-            return "\(head) 豁免：\(exemption)"
+        let floor = String(
+            format: "%@ 下限 %d%% %@",
+            verdict.meetsRatioFloor ? "≥" : "<",
+            Int(minContentRatio * 100),
+            verdict.meetsRatioFloor ? "达标" : "不达标"
+        )
+        switch verdict.rule {
+        case .ratioFloor:
+            return "\(head) \(floor)"
+        case .fixedOverhead:
+            let breakdown = String(
+                format: "；内容 < %dpt，改判固定开销 %.0fpt：总高 %.0f = %.0f + %.0f %@",
+                Int(ratioFloorContentHeight), verdict.overhead,
+                verdict.total, verdict.content, verdict.overhead,
+                verdict.overheadIsFixed ? "达标" : "不达标"
+            )
+            return "\(head) \(floor)\(breakdown)"
         }
-        return "\(head) ≥ 下限 \(Int(minContentRatio * 100))%"
     }
 
-    /// 下限：高度至少要放得下 chrome 行 + 间距 + 上下内边距（内容高度可以为 0）。
-    static let minSize = CGSize(
-        width: 200,
-        height: chromeHeight + rowSpacing + contentPadding * 2
-    )
+    /// 下限：高度至少要放得下 chrome 行 + 间距 + 顶部/底部内边距（内容高度可以为 0）。
+    static var minSize: CGSize {
+        CGSize(
+            width: 200,
+            height: topInset + chromeHeight + rowSpacing + contentPadding
+        )
+    }
     /// 上限：单页内容过大时的封顶值，保证窗口不会被一页撑爆。
-    /// 212pt 是文件架「3 整行 + 第 4 行露出 20pt」所需的高度；
-    /// 不做「4 条整行」的 224——那已脱离刘海形态。
-    static let maxSize = CGSize(width: 640, height: 212)
+    ///
+    /// **232pt** = 文件架「3 整行 112 + 第 4 行露出 20pt」的视口 140 + 固定开销 92。
+    /// 定稿口径（不再有 DEV-TEMP）：232 就是真实需求，244 会多出 12pt 纯留白
+    /// （拆解后 244 的 +32 里有 16pt 与已有顶部内边距重复、12pt 是行间距重复）。
+    static let maxSize = CGSize(width: 640, height: 232)
 
-    static func shapeSize(for item: ExpandedItem, shelfCount: Int = 0) -> CGSize {
+    static func shapeSize(
+        for item: ExpandedItem,
+        shelfCount: Int = 0,
+        home: HomeLayout = .playing,
+        playersEnabled: Int = 0
+    ) -> CGSize {
         let content = item.contentSize
         return CGSize(
-            width: min(max(content.width + contentPadding * 2, minSize.width), maxSize.width),
+            width: min(max(content.width + openContentHorizontalInset * 2, minSize.width), maxSize.width),
             height: min(
                 max(
-                    contentHeight(for: item, shelfCount: shelfCount)
-                        + chromeHeight + rowSpacing + contentPadding * 2,
+                    contentHeight(for: item, shelfCount: shelfCount, home: home, playersEnabled: playersEnabled)
+                        + chromeHeight + rowSpacing + topInset + contentPadding,
                     minSize.height
                 ),
                 maxSize.height
@@ -208,10 +373,12 @@ enum PageMetrics {
     }
 
     /// 所有页面里最大的形状尺寸：窗口按它固定，切页只改内容不改窗口。
-    /// 文件架按溢出态（4 条）计算，否则窗口会被一屏之外的内容裁掉。
+    /// 文件架按溢出态（4 条）计算，否则窗口会被一屏之外的内容裁掉；
+    /// 其余页取子态最高档（首页播放中 56、设置页 2 个已开启 130）。
     static var maxShapeSize: CGSize {
         ExpandedItem.allCases.reduce(CGSize.zero) { partial, item in
-            let size = shapeSize(for: item, shelfCount: overflowShelfCount)
+            let shelf = item == .files ? overflowShelfCount : 0
+            let size = shapeSize(for: item, shelfCount: shelf, home: .playing, playersEnabled: 2)
             return CGSize(width: max(partial.width, size.width), height: max(partial.height, size.height))
         }
     }

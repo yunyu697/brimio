@@ -29,10 +29,29 @@ final class NotchViewModel: ObservableObject {
     @Published private(set) var shelfItems: [ShelfItem] = []
     /// 外部文件正拖到刘海上：只驱动描边高亮，不参与尺寸预算。
     @Published private(set) var isFileDragTarget = false
+    /// 拖入指针位置（根视图坐标）：只给文件架做边缘自动滚动，nil 表示没有拖动。
+    @Published private(set) var fileDropLocation: CGPoint?
 
     let closedSize: CGSize
     /// 菜单栏高度，用来算刘海下方的 chin。
     let menuBarHeight: CGFloat
+
+    /// 刘海硬件半宽（唯一来源 `NotchHardware`）；无刘海屏为 nil。
+    ///
+    /// 闭合态缩略图与展开态内容都靠它让位，不再从「闭合宽度 − 4」自己反推边界。
+    var hardwareHalfWidth: CGFloat?
+
+    /// 闭合态缩略图右侧内边距：位置由硬件右缘 + `contentGap` 反推，
+    /// 而不是沿用形状自身的抗锯齿外扩来凑。
+    var closedBadgeTrailing: CGFloat {
+        guard let hardwareHalfWidth, closedBadgeExtraWidth > 0 else { return DesignSystem.Spacing.sm }
+        let width = notchSize.width
+        let shift = closedBadgeExtraWidth / 2
+        let centerLocal = width / 2 - shift
+        let target = centerLocal + hardwareHalfWidth + NotchHardware.contentGap
+            + DesignSystem.Size.closedBadge
+        return max(0, width - target)
+    }
 
     /// 当前内容尺寸。
     ///
@@ -54,14 +73,36 @@ final class NotchViewModel: ObservableObject {
         )
     }
 
-    /// 当前页的面板尺寸：文件架的高度随条目数变化，其余页等价于 `item.shapeSize`。
+    /// 首页当前版式：判定顺序只有 `HomeLayout.resolve` 一处，视图与尺寸共用。
+    var homeLayout: HomeLayout {
+        HomeLayout.resolve(media: media, permission: mediaPermission)
+    }
+
+    /// 已开启的第三方播放器个数：设置页内容高随列表行变化。
+    var enabledThirdPartyPlayerCount: Int {
+        PlayerRegistry.entries.filter(\.isThirdParty)
+            .filter { PlayerRegistry.isEnabled($0.bundleID) }
+            .count
+    }
+
+    /// 当前页的面板尺寸：文件架随条目数、首页随版式、设置页随已开启个数变化。
     var routeShapeSize: CGSize {
-        PageMetrics.shapeSize(for: route, shelfCount: shelfItems.count)
+        PageMetrics.shapeSize(
+            for: route,
+            shelfCount: shelfItems.count,
+            home: homeLayout,
+            playersEnabled: enabledThirdPartyPlayerCount
+        )
     }
 
     /// 当前页的内容高度（视图按它撑开页面容器）。
     var routeContentHeight: CGFloat {
-        PageMetrics.contentHeight(for: route, shelfCount: shelfItems.count)
+        PageMetrics.contentHeight(
+            for: route,
+            shelfCount: shelfItems.count,
+            home: homeLayout,
+            playersEnabled: enabledThirdPartyPlayerCount
+        )
     }
 
     /// 闭合态缩略图位：有播放会话才占宽，没有则完全为 0（不占位）。
@@ -129,10 +170,19 @@ final class NotchViewModel: ObservableObject {
     /// 拖出完成：move 之后原路径失效，条目必须立即消失。
     func applyShelfDragOut(_ url: URL, operation: NSDragOperation) {
         _ = FileShelfStore.applyDragOut(url: url, operation: operation, items: &shelfItems)
+        // 真机验收要能在日志里看到「拖出确实结束、结束成了什么」。
+        NSLog("[DRAG] drag-out name=%@ op=%lu remaining=%d",
+              url.lastPathComponent as NSString, operation.rawValue, shelfItems.count)
     }
 
     func setFileDragTarget(_ active: Bool) {
         isFileDragTarget = active
+    }
+
+    /// 拖入位置由根视图的 `FileDropDelegate` 在 `dropUpdated` 里推入；离开/松手推 nil。
+    func setFileDropLocation(_ location: CGPoint?) {
+        guard fileDropLocation != location else { return }
+        fileDropLocation = location
     }
 
     /// 开合各用一条曲线，但仍然是唯一动画源：
@@ -188,19 +238,26 @@ final class NotchViewModel: ObservableObject {
         AnimationTrigger(size: notchSize, route: route)
     }
 
-    /// 顶部圆角：闭合 6，展开 0（方角）。
+    /// 顶部凹肩的切点偏移 t：同一构造、两个标量（闭合 6 / 展开 19），切换时随形状逐帧插值。
     ///
-    /// 展开态取 0：面板的顶边就压在屏幕顶边上，任何正圆角（19pt 更明显）都会在屏幕顶边
-    /// 与形状之间露出左右两个背景三角。改成方角后，顶边整条与屏幕顶边齐平。
-    /// 闭合态仍用 6，与物理刘海下缘的弧度衔接。
-    var topCornerRadius: CGFloat {
-        isOpen ? 0 : ScreenGeometry.cornerRadiusInsets.closed.top
+    /// 参数是**切点偏移**，不是 cornerRadius；取值来源与量纲推导见
+    /// `ScreenGeometry.shoulderTangentOffset`（来源=参照实现，6→6 标定成立）。
+    /// 这个值同时被顶部 1pt 遮缝条复用为横向内缩（见 `NotchRootView`）。
+    var topTangentOffset: CGFloat {
+        isOpen ? ScreenGeometry.cornerRadiusInsets.opened.top
+            : ScreenGeometry.cornerRadiusInsets.closed.top
     }
 
-    /// 底部圆角：闭合 14、展开 24。闭合高度只有 32，14 让两侧仍留直线段；
-    /// 展开后 24 收口更圆，与顶部方角形成「上平下圆」。
-    var bottomCornerRadius: CGFloat {
+    /// 底部切点偏移：闭合 14、展开 24。闭合高度只有 32，14 让两侧仍留直线段；
+    /// 展开后 24 收口更圆，与顶部内凹肩形成「上收下放」。
+    var bottomTangentOffset: CGFloat {
         isOpen ? ScreenGeometry.cornerRadiusInsets.opened.bottom : ScreenGeometry.cornerRadiusInsets.closed.bottom
+    }
+
+    /// 内容左右内缩：由 `topTangentOffset` 驱动 + 侧壁净间隙
+    /// → 闭合 6+4=10、展开 19+4=23。内容盒始终在侧壁内侧，不贴壁。
+    var contentHorizontalInset: CGFloat {
+        PageMetrics.contentHorizontalInset(topTangentOffset: topTangentOffset)
     }
 
     /// 刘海和菜单栏底边之间的透明黑补块高度。

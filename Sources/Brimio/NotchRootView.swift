@@ -18,6 +18,13 @@ struct NotchRootView: View {
     let onOpenPlayerSettings: () -> Void
     /// 文件拖到刘海上松手：交给窗口控制器加进文件架并切到文件架页。
     let onDropFiles: ([URL]) -> Void
+    /// 文件架条目拖出结束：AppKit 给的最终 operation（move 删条目 / copy 保留）。
+    let onDragOutFile: (URL, NSDragOperation) -> Void
+    /// 是否绘制形状本体（黑底、圆角裁剪、顶部补线、阴影、拖放描边）。
+    ///
+    /// `--render-geometry` 的内容门禁用 `false` 渲染：只留内容层、去掉形状自身，
+    /// 这样禁画区里出现的任何亮像素都只能来自内容，与形状抗锯齿无关。
+    var showsShape: Bool = true
 
     var body: some View {
         // 顶对齐：VStack(spacing: 0) + frame(maxHeight: windowSize.height, alignment: .top)，
@@ -25,6 +32,9 @@ struct NotchRootView: View {
         VStack(spacing: DesignSystem.Spacing.none) {
             content
                 .frame(width: vm.notchSize.width, height: vm.notchSize.height)
+                // 命名坐标空间：文件架要把 drop 的根视图坐标换算到自己的视口坐标，
+                // 名字只在这棵子树内有效。
+                .coordinateSpace(name: NotchCoordinateSpace.content)
                 // 自测用采样器：把尺寸包进 Animatable，SwiftUI 每插值一帧就会调一次
                 // animatableData 的 setter，于是能拿到真实的中间尺寸序列（--animate-probe）。
                 // 注意：必须放在 `.animation` 之前，也就是它的子树内；
@@ -33,37 +43,59 @@ struct NotchRootView: View {
                 // 整个采样设施只在 DEBUG 构建存在（Release 下这个 modifier 是空的）。
                 .modifier(DebugSizeProbe(size: vm.notchSize))
                 .background(DesignSystem.Colors.surface)
-                .clipShape(
-                    NotchShape(
-                        topCornerRadius: vm.topCornerRadius,
-                        bottomCornerRadius: vm.bottomCornerRadius
+                .modifier(
+                    ShapeMask(
+                        enabled: showsShape,
+                        topTangentOffset: vm.topTangentOffset,
+                        bottomTangentOffset: vm.bottomTangentOffset
                     )
                 )
+                // 同色 overscan：形状外侧垫 0.5pt 黑底，盖住抗锯齿那 1 个过渡像素。
+                // 位置必须紧跟 ShapeMask：在这一层之外，不会被同一条路径裁掉；
+                // 又必须在 shadowLayer 之前，否则会把方向性阴影盖住。
+                .background { if showsShape { overscanLayer } }
                 // 顶部 1pt 补线：
                 // 在两侧顶部圆角之间补一条黑线，避免顶边和屏幕边缘之间出现发丝缝。
                 .overlay(alignment: .top) {
-                    Rectangle()
-                        .fill(DesignSystem.Colors.surface)
-                        .frame(height: DesignSystem.Size.hairline)
-                        .padding(.horizontal, vm.topCornerRadius)
+                    if showsShape {
+                        Rectangle()
+                            .fill(DesignSystem.Colors.surface)
+                            .frame(height: DesignSystem.Size.hairline)
+                            .padding(.horizontal, vm.topTangentOffset)
+                    }
                 }
                 // 方向性阴影：顶部完全不投影，只在下方与两侧下缘出现。
                 // 若用一圈均匀投影（`.shadow(0.7, radius: 6)`），贴顶的面板左右会留下
                 // 从 y=0 开始的竖向暗带（实测 82.7/255），看起来像浮在屏幕上的卡片。
-                .background { shadowLayer }
+                .background { if showsShape { shadowLayer } }
                 // 缩略图只向右长：形状整体右移半个增量，让刘海本体左缘不动。
                 // 展开时增量归 0，位移随开合一起插值。
                 .offset(x: vm.closedBadgeOffset)
                 .contentShape(Rectangle())
                 .onTapGesture { onTap() }
                 // 外部文件拖到刘海上：闭合态也要能接（拖动期间窗口被临时设为可交互）。
-                .onDrop(of: [.fileURL], delegate: FileDropDelegate(onFiles: onDropFiles))
+                // 落点必须落在形状路径内：拖动期间整窗可交互，透明边缘的圆角区域也会
+                // 进 hosting view，不判路径的话「拖到面板外的空白」也会被当成有效落点。
+                .onDrop(
+                    of: [.fileURL],
+                    delegate: FileDropDelegate(
+                        onFiles: onDropFiles,
+                        onLocation: { [weak vm] location in vm?.setFileDropLocation(location) },
+                        shapeContains: { [weak vm] point in
+                            guard let vm else { return false }
+                            return NotchShape(
+                                topTangentOffset: vm.topTangentOffset,
+                                bottomTangentOffset: vm.bottomTangentOffset
+                            ).contains(point, in: CGRect(origin: .zero, size: vm.notchSize))
+                        }
+                    )
+                )
                 // 拖动经过时给形状描一圈亮边：不加宽、不出文字，不改变任何尺寸。
                 .overlay {
-                    if vm.isFileDragTarget {
+                    if showsShape && vm.isFileDragTarget {
                         NotchShape(
-                            topCornerRadius: vm.topCornerRadius,
-                            bottomCornerRadius: vm.bottomCornerRadius
+                            topTangentOffset: vm.topTangentOffset,
+                            bottomTangentOffset: vm.bottomTangentOffset
                         )
                         .stroke(DesignSystem.Colors.textSecondary, lineWidth: DesignSystem.Size.hairline)
                     }
@@ -93,6 +125,22 @@ struct NotchRootView: View {
         .preferredColorScheme(.dark)
     }
 
+    /// 形状外侧的同色 overscan（0.5pt）。
+    ///
+    /// 为什么需要：形状的直边一旦落在半像素上，`clipShape` 输出的最外一列像素只有部分覆盖，
+    /// 剩下的部分由下层背景补上——深色壁纸上不明显，浅色壁纸/白色窗口上就是一圈 1 像素亮线
+    /// （实测该像素亮度 160–166/255）。这里在主形状外面再垫一层同样的黑、外扩 0.5pt，
+    /// 主形状的抗锯齿像素于是压在同色上而不是浅色背景上，合成结果仍是黑。
+    /// 圆角弧段同理，但弧段的覆盖比例变化快，最外 1 像素仍可能有极轻的过渡。
+    private var overscanLayer: some View {
+        NotchShape(
+            topTangentOffset: vm.topTangentOffset,
+            bottomTangentOffset: vm.bottomTangentOffset
+        )
+        .fill(DesignSystem.Colors.surface)
+        .padding(-DesignSystem.Size.overscan)
+    }
+
     /// 方向性阴影层：把形状自身当作投影源，先用竖向渐变遮掉顶部一段再发散。
     ///
     /// 为什么要这么做：`.shadow` 是四周均匀的，面板贴着屏幕顶边时会把阴影也往 y<0 和
@@ -100,8 +148,8 @@ struct NotchRootView: View {
     /// 所以顶部 25% 高度天然不投影，只有下方与两侧下缘有。
     private var shadowLayer: some View {
         NotchShape(
-            topCornerRadius: vm.topCornerRadius,
-            bottomCornerRadius: vm.bottomCornerRadius
+            topTangentOffset: vm.topTangentOffset,
+            bottomTangentOffset: vm.bottomTangentOffset
         )
         .fill(DesignSystem.Colors.surface)
         .mask(
@@ -134,12 +182,13 @@ struct NotchRootView: View {
         // （采样序列会交出错乱的两条曲线），闭合态的黑底也会跟着重建。
         // 这里固定一层 ZStack：黑底常驻，展开的文字用 opacity 叠加。
         ZStack(alignment: .topLeading) {
-            DesignSystem.Colors.surface
+            if showsShape { DesignSystem.Colors.surface }
             ExpandedContentView(
                 vm: vm,
                 onSelect: onSelect,
                 onMediaControl: onMediaControl,
-                onOpenPlayerSettings: onOpenPlayerSettings
+                onOpenPlayerSettings: onOpenPlayerSettings,
+                onDragOutFile: onDragOutFile
             )
             .opacity(vm.isOpen ? 1 : 0)
             // 闭合态徽标：挂在刘海右侧的加宽位里，展开时淡出。
@@ -147,9 +196,35 @@ struct NotchRootView: View {
             // 实体遮挡区，文字画在那儿等于画在硬件背后。presence-only 用播放器图标表达。
             ClosedMediaBadge(media: vm.media)
                 .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .trailing)
-                .padding(.trailing, DesignSystem.Spacing.sm)
+                .padding(.trailing, vm.closedBadgeTrailing)
                 .opacity(vm.showsClosedBadge ? 1 : 0)
                 .allowsHitTesting(false)
+        }
+    }
+}
+
+/// 根视图内容层的命名坐标空间。
+///
+/// 只有文件架的自动滚动需要它：`DropInfo.location` 给的是内容层坐标，
+/// 文件架要把自己的视口 frame 换算到同一坐标系才能判断指针在不在视口里。
+enum NotchCoordinateSpace {
+    static let content = "notchContent"
+}
+
+/// 形状裁剪。`enabled == false` 时不裁任何东西（内容门禁只要内容层）。
+private struct ShapeMask: ViewModifier {
+    let enabled: Bool
+    let topTangentOffset: CGFloat
+    let bottomTangentOffset: CGFloat
+
+    @ViewBuilder
+    func body(content: Content) -> some View {
+        if enabled {
+            content.clipShape(
+                NotchShape(topTangentOffset: topTangentOffset, bottomTangentOffset: bottomTangentOffset)
+            )
+        } else {
+            content
         }
     }
 }

@@ -27,13 +27,43 @@ enum ScreenGeometry {
         )
     }
 
-    /// 四组圆角：opened top 19 / bottom 24，closed top 6 / bottom 14。
-    /// 实际生效的展开态顶部圆角是 0（见 `NotchViewModel.topCornerRadius`）：面板顶边压在屏幕顶边上，
-    /// 正圆角会在顶边与形状之间露出两个背景三角。
+    /// 顶部凹肩的**切点偏移 t**（不是 cornerRadius）。
+    ///
+    /// 构造（与参照实现同一套）：从左上角起笔逆时针一圈，4 条直线 + 4 条二次贝塞尔；
+    /// 顶部角的控制点落在「角点沿顶边内移 t」处、终点 `(t, t)`，于是起点切线水平、
+    /// 终点切线垂直。t 同时是 x / y 方向的切点偏移，占一个 t×t 的方区。
+    /// 它不是圆弧：二次曲线中点过 `(0.75t, 0.25t)`，比同半径圆弧更贴角点约 6%；
+    /// 把它喂进「圆角」通道会得到外凸，只有作为切点偏移才是内凹肩。
+    ///
+    /// 两态取值（同一路径、两个标量，状态切换时逐帧插值）：
+    /// - 闭合 `top 6 / bottom 14`
+    /// - 展开 `top 19 / bottom 24`
+    ///
+    /// 来源 = **参照实现**，不是实测。6→6 标定成立：
+    /// 1. 同一构造：控制点 `(t, 0)`、终点 `(t, t)`、起点切线水平（见 `NotchShape`）；
+    /// 2. 同一窗口侧口径：宽 = 硬件带 + 4、闭合高 = `safeAreaInsets.top`、顶边贴屏顶；
+    ///    本机硬件带 179×32 → 闭合 183×32，与参照一致；
+    /// 3. 因此双方参数是同一量纲（切点偏移），没有换算系数，参照的 19 直接映射为我们的 19。
+    ///
+    /// 仍未实测的是**绝对值**：真机照片量不出肩弧（见 README），6 与 19 都只能算
+    /// 「与参照同档」，没有像素证据能独立复核；但两态的比值 19/6 与参照一致。
+    static let shoulderTangentOffset: (closed: CGFloat, opened: CGFloat) = (closed: 6, opened: 19)
+
+    /// 四组切点偏移：opened bottom 24 / closed bottom 14；顶部取 `shoulderTangentOffset`。
     static let cornerRadiusInsets: (
         opened: (top: CGFloat, bottom: CGFloat),
         closed: (top: CGFloat, bottom: CGFloat)
-    ) = (opened: (top: 19, bottom: 24), closed: (top: 6, bottom: 14))
+    ) = (
+        opened: (top: shoulderTangentOffset.opened, bottom: 24),
+        closed: (top: shoulderTangentOffset.closed, bottom: 14)
+    )
+
+    /// 当前状态的顶部切点偏移：闭合 6 / 展开 19。
+    /// 内容的左右内缩由它派生（`PageMetrics.contentHorizontalInset` = t + `NotchHardware.contentGap`），
+    /// 与顶部 1pt 遮缝条的横向内缩共用同一个值。
+    static func contentInsetExpectation(isOpen: Bool) -> CGFloat {
+        isOpen ? cornerRadiusInsets.opened.top : cornerRadiusInsets.closed.top
+    }
 
     /// 无刘海屏的兜底刘海宽度。
     /// 185：无刘海屏没有物理刘海可对齐，这个宽度与菜单栏图标密度下的视觉重心相称。
@@ -56,6 +86,12 @@ enum ScreenGeometry {
         var auxLeftWidth: CGFloat?
         var auxRightWidth: CGFloat?
         var name: String
+        /// 持久屏幕标识（`CGDisplayCreateUUIDFromDisplayID`），只用于缓存分区；
+        /// 注入几何时为 nil，缓存改用 `name` 作 key。
+        var screenUUID: String? = nil
+        /// 设备像素比（2x 屏为 2）。几何量化要用它把点值对齐到整设备像素；
+        /// 注入几何时默认 2——注入断言只验证算法，不验证真机像素。
+        var backingScaleFactor: CGFloat = 2
 
         static func from(_ screen: NSScreen) -> Metrics {
             Metrics(
@@ -64,9 +100,18 @@ enum ScreenGeometry {
                 safeAreaTop: screen.safeAreaInsets.top,
                 auxLeftWidth: screen.auxiliaryTopLeftArea?.width,
                 auxRightWidth: screen.auxiliaryTopRightArea?.width,
-                name: screen.localizedName
+                name: screen.localizedName,
+                screenUUID: displayUUID(of: screen),
+                backingScaleFactor: screen.backingScaleFactor
             )
         }
+    }
+
+    /// 把点值量化到整设备像素：2x 屏是 0.5pt 一档，1x 屏是 1pt 一档。
+    /// 形状边缘落在半像素上时，最外一列像素只有部分覆盖，浅色背景透出来就是那条白线。
+    static func pixelAligned(_ value: CGFloat, scale: CGFloat) -> CGFloat {
+        guard scale > 0 else { return value }
+        return (value * scale).rounded() / scale
     }
 
     /// 只有显式传入 `--headless-geometry=...`（或环境变量）时才非空。
@@ -132,7 +177,10 @@ enum ScreenGeometry {
             height = value
         }
 
-        return CGSize(width: min(width, maxOpenSize.width), height: max(height, 1))
+        return CGSize(
+            width: min(pixelAligned(width, scale: metrics.backingScaleFactor), maxOpenSize.width),
+            height: max(pixelAligned(height, scale: metrics.backingScaleFactor), 1)
+        )
     }
 
     /// 菜单栏高度：`frame.maxY - visibleFrame.maxY`。
@@ -162,12 +210,22 @@ enum ScreenGeometry {
     }
 
     /// 窗口矩形：固定 windowSize，顶边贴屏幕顶边、水平居中。
+    ///
+    /// 水平方向量化到整设备像素：形状的水平边缘 = 窗口 origin.x + 窗口内居中偏移，
+    /// origin.x 落在半像素上时形状最外一列只有部分覆盖，会透出一圈 1 像素的亮线。
+    /// 竖向不量化：顶边是屏幕物理边界，那条边必须严格贴 `frame.maxY`；
+    /// 高度是固定整点值，y = maxY − height 本身就在设备像素上。
     static func windowFrame(for screen: NSScreen) -> NSRect {
         windowFrame(for: Metrics.from(screen))
     }
 
     static func windowFrame(for metrics: Metrics) -> NSRect {
-        rectAtTopCenter(size: windowSize, on: metrics)
+        let size = windowSize
+        let x = pixelAligned(
+            metrics.frame.origin.x + (metrics.frame.width - size.width) / 2,
+            scale: metrics.backingScaleFactor
+        )
+        return NSRect(x: x, y: metrics.frame.maxY - size.height, width: size.width, height: size.height)
     }
 
     /// 闭合态的命中矩形（也就是视觉上的刘海）。

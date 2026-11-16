@@ -1,5 +1,26 @@
 import SwiftUI
 
+/// 授权引导行的 hover 状态：`@State` 依赖 SwiftUI 宏，本仓库的 SwiftPM 工具链插件
+/// 在这台机器上不可用；与 `ShelfHoverState` 同口径用 `ObservableObject`。
+@MainActor
+final class GuideHoverState: ObservableObject {
+    @Published var isHovered = false
+}
+
+/// 设置页列表图标的**测试夹具**：`nil` 时走生产路径（本机真实 app 图标）。
+///
+/// 基线/离屏渲染注入一个固定符号（见 `main.swift` 的 `--render-baseline` / `--render`），
+/// 目的是让参考图跨机器可复现——真实图标取决于「这台机器装没装那个 app」。
+/// 夹具只替换**画什么图**，不替换 16pt 尺寸、8pt 间距和 23 内容盒列位置，
+/// 所以列布局、行高、文字宽度这些会出问题的量仍然由像素和 text-fit 看着；
+/// 真实图标路径本身不涉及几何，退化分支（未安装）也用同一个 16pt 框。
+enum PlayerIconFixture {
+    /// 夹具符号名（SF Symbol）；nil = 生产路径。
+    static var symbolName: String?
+    /// 夹具使用的固定占位符号。
+    static let baselineSymbol = "app.fill"
+}
+
 /// 展开态的内容骨架：唯一一行 chrome（Tab 图标，28pt）→ 页面容器。
 ///
 /// 加一个页面只动 `ExpandedItem`（加 case / 图标 / 尺寸）和 `page(for:)`（加分支），
@@ -16,6 +37,10 @@ struct ExpandedContentView: View {
     let onMediaControl: (MediaControl) -> Void
     /// 播放器兼容：面板里只放摘要和入口，详细开关在独立设置窗口。
     let onOpenPlayerSettings: () -> Void
+    /// 文件架条目拖出结束（最终 operation 由 AppKit 会话给出）。
+    let onDragOutFile: (URL, NSDragOperation) -> Void
+    /// 授权引导行是否悬停：只驱动 hover 底色，不参与尺寸。
+    @StateObject private var guideHover = GuideHoverState()
 
     var body: some View {
         VStack(alignment: .leading, spacing: DesignSystem.Spacing.md) {
@@ -24,9 +49,14 @@ struct ExpandedContentView: View {
         }
         // 四边用同一组 padding token：整块内容左对齐到同一条竖线，
         // 底部也留同样的一档，不再让不同页面把剩余高度撑成不同留白。
-        // 展开态顶部是方角（见 NotchViewModel.topCornerRadius），
-        // 留 lg(16pt) 是为了避开首行图标贴住屏幕顶边/阴影，不是为圆角让位。
-        .padding(DesignSystem.Spacing.lg)
+        // 顶部取 `PageMetrics.topInset`：有刘海时它是「硬件矩形下缘 + contentGap」，
+        // 也就是展开态唯一的一条竖向让位规则（不按页特判），
+        // 让 chrome 行与整页内容一起落到硬件矩形之下。
+        // 左右取 `vm.contentHorizontalInset`：= 顶部切点偏移 t + 4pt 净间隙（闭合 10 / 展开 23），
+        // 内容盒因此始终在侧壁内侧，不再是固定 16（展开 t=19 时会被裁 3pt）。
+        .padding(.top, PageMetrics.topInset)
+        .padding(.horizontal, vm.contentHorizontalInset)
+        .padding(.bottom, DesignSystem.Spacing.lg)
         .foregroundStyle(DesignSystem.Colors.textPrimary)
     }
 
@@ -132,28 +162,38 @@ struct ExpandedContentView: View {
 
     // MARK: - 首页（媒体页）
 
-    /// 四种状态共用同一个 268×56 的槽位，面板高度不因状态跳变：
-    /// 只有 IOPM 状态 → 一行「App · 正在播放」+ 媒体键说明；有曲目 → 封面 + 曲名/副信息 + 控制；
-    /// 拒绝授权 → 一行可点击的授权引导；什么都没有 → 空态说明。
-    ///
-    /// 顺序就是优先级：IOPM 状态压过授权引导（有状态可显示时不必优先劝授权），
-    /// 曲目压过状态（元数据永远比「谁在播」信息量大）。
+    /// 四种版式高度不同（SPEC §7.2 / §9.2）：播放中 56 → H148；只有状态 28 → H120；
+    /// 拒绝授权 28 → H120；空态 15 → H107。版式判定只在 `HomeLayout.resolve` 一处，
+    /// 这里只做分支，不重复优先级。
     @ViewBuilder
     private var homePage: some View {
-        if vm.media.isPresenceOnly {
+        switch vm.homeLayout {
+        case .presenceOnly:
             presenceRow
-        } else if vm.media.hasTrack {
+        case .playing:
             mediaRow
-        } else if vm.mediaPermission == .denied {
+        case .permissionDenied:
             automationGuide
-        } else {
+        case .empty:
             emptyMedia
         }
     }
 
     /// IOPM 通道：知道「谁在播」，但拿不到曲目。不编造曲名，也不放假控制按钮，
     /// 只说明这行状态和去哪里控制。
+    ///
+    /// 宽度不足时**整块隐藏右侧提示**（SPEC §7.7.4），主文字保持 1 行尾部截断；
+    /// 不缩字号、不换行、不出现省略号掩盖状态。
     private var presenceRow: some View {
+        ViewThatFits(in: .horizontal) {
+            presenceLine(showHint: true)
+            presenceLine(showHint: false)
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .frame(height: DesignSystem.Control.md)
+    }
+
+    private func presenceLine(showHint: Bool) -> some View {
         HStack(spacing: DesignSystem.Spacing.sm) {
             Image(systemName: "music.note")
                 .resizable()
@@ -164,15 +204,14 @@ struct ExpandedContentView: View {
                 .lineLimit(1)
                 .textLineBox(DesignSystem.Typography.body)
                 .foregroundStyle(DesignSystem.Colors.textPrimary)
-            Spacer(minLength: DesignSystem.Spacing.sm)
-            Text("用键盘媒体键 ⏮ ⏯ ⏭ 控制")
-                .lineLimit(1)
-                .minimumScaleFactor(0.9)
-                .textLineBox(DesignSystem.Typography.body)
-                .foregroundStyle(DesignSystem.Colors.textTertiary)
+            if showHint {
+                Spacer(minLength: DesignSystem.Spacing.sm)
+                Text(HomeCopyTable.presenceHint)
+                    .lineLimit(1)
+                    .textLineBox(DesignSystem.Typography.body)
+                    .foregroundStyle(DesignSystem.Colors.textTertiary)
+            }
         }
-        .frame(maxWidth: .infinity, alignment: .leading)
-        .frame(height: DesignSystem.Size.cover)
     }
 
     /// 一行媒体信息：左封面、中曲名/副信息、右控制按钮。
@@ -231,6 +270,7 @@ struct ExpandedContentView: View {
     }
 
     /// 授权被拒：不能空白、不能反复弹窗，给一行能直接跳到系统设置的引导。
+    /// 行容器高 = max(28, 15 × 声明行数)，单行档 28 → H120；整行可点，hover 白 6%。
     private var automationGuide: some View {
         Button {
             openAutomationSettings()
@@ -241,11 +281,11 @@ struct ExpandedContentView: View {
                     .scaledToFit()
                     .frame(width: DesignSystem.Size.icon, height: DesignSystem.Size.icon)
                     .foregroundStyle(DesignSystem.Colors.textSecondary)
-                Text("允许控制音乐，去系统设置开启")
-                    .lineLimit(1)
-                    .textLineBox(DesignSystem.Typography.body)
+                Text(HomeCopyTable.deniedText)
+                    .lineLimit(HomeCopyTable.deniedLines)
+                    .textStyle(DesignSystem.Typography.body)
                     .foregroundStyle(DesignSystem.Colors.textPrimary)
-                Spacer(minLength: DesignSystem.Spacing.none)
+                    .frame(maxWidth: .infinity, alignment: .leading)
                 Image(systemName: "chevron.right")
                     .resizable()
                     .scaledToFit()
@@ -253,20 +293,27 @@ struct ExpandedContentView: View {
                     .foregroundStyle(DesignSystem.Colors.textTertiary)
             }
             .frame(maxWidth: .infinity, alignment: .leading)
-            .frame(height: DesignSystem.Size.cover)
+            .frame(height: HomeCopyTable.deniedRowHeight)
             .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
+        .background(
+            RoundedRectangle(cornerRadius: DesignSystem.Radius.small, style: .continuous)
+                .fill(DesignSystem.Colors.hoverFill)
+                .opacity(guideHover.isHovered ? 1 : 0)
+        )
+        .onHover { guideHover.isHovered = $0 }
     }
 
     /// 已授权但没在播放：空态说明（属于空态文案，不是常驻状态标签）。
+    /// 高度 = 15 × 声明行数（单行 15 → H107），行数档位只在 `HomeCopyTable` 里声明。
     private var emptyMedia: some View {
-        Text("暂无播放，先在 Music 里放一首")
-            .lineLimit(1)
-            .textLineBox(DesignSystem.Typography.body)
+        Text(HomeCopyTable.emptyText)
+            .lineLimit(HomeCopyTable.emptyLines)
+            .textStyle(DesignSystem.Typography.body)
             .foregroundStyle(DesignSystem.Colors.textSecondary)
             .frame(maxWidth: .infinity, alignment: .leading)
-            .frame(height: DesignSystem.Size.cover)
+            .frame(height: HomeCopyTable.emptyBlockHeight)
     }
 
     private func openAutomationSettings() {
@@ -315,9 +362,12 @@ struct ExpandedContentView: View {
     /// 文件架：空态虚线框，或有文件时的一屏三行（第 4 行起滚动）。
     /// 条目只是 URL 引用，视图层不读内容、不生成缩略图。
     private var filesPage: some View {
-        FileShelfView(items: vm.shelfItems) { item in
-            vm.removeShelfFile(item)
-        }
+        FileShelfView(
+            items: vm.shelfItems,
+            onRemove: { item in vm.removeShelfFile(item) },
+            onDragOut: onDragOutFile,
+            dropLocation: vm.fileDropLocation
+        )
     }
 
     private var timerPage: some View {
@@ -327,34 +377,110 @@ struct ExpandedContentView: View {
             .frame(maxWidth: .infinity, alignment: .leading)
     }
 
+    /// 设置页（SPEC §8.5）：摘要两行 → 已开启的第三方（0/1/2 行）→ 入口按钮。
+    /// 内容高只按实际渲染的行高求和：34 + 列表(0 / 28 / 56) + 12 + 28 → 74 / 102 / 130。
+    /// 入口按钮是「整行持久填充面」，左右再内缩 4（E7）：254 → 246，x = 23 + 4 = 27。
     private var playersPage: some View {
         // 读一次版本号，开关变化后这一页跟着重算。
         let version = vm.playerSettingsVersion
         let thirdParty = PlayerRegistry.entries.filter(\.isThirdParty)
-        let enabledCount = thirdParty.filter { PlayerRegistry.isEnabled($0.bundleID) }.count
-        return VStack(alignment: .leading, spacing: DesignSystem.Spacing.sm) {
-            Text("系统播放器：Music、Spotify（系统弹窗授权）")
-                .lineLimit(1)
-                .textLineBox(DesignSystem.Typography.body)
-                .foregroundStyle(DesignSystem.Colors.textTertiary)
-            Text("第三方播放器：\(enabledCount)/\(thirdParty.count) 已开启，默认关闭。")
-                .lineLimit(1)
-                .textLineBox(DesignSystem.Typography.body)
-                .foregroundStyle(DesignSystem.Colors.textTertiary)
+        let enabled = thirdParty.filter { PlayerRegistry.isEnabled($0.bundleID) }
+        return VStack(alignment: .leading, spacing: DesignSystem.Spacing.none) {
+            VStack(alignment: .leading, spacing: DesignSystem.Spacing.xs) {
+                Text("系统播放器：Music、Spotify（恒开）")
+                    .lineLimit(1)
+                    .textLineBox(DesignSystem.Typography.body)
+                    .foregroundStyle(DesignSystem.Colors.textSecondary)
+                Text("第三方 \(enabled.count)/\(thirdParty.count) 已开启 · 默认关闭")
+                    .lineLimit(1)
+                    .textLineBox(DesignSystem.Typography.body)
+                    .foregroundStyle(enabled.isEmpty
+                        ? DesignSystem.Colors.textTertiary
+                        : DesignSystem.Colors.textSecondary)
+            }
+            if !enabled.isEmpty {
+                VStack(alignment: .leading, spacing: DesignSystem.Spacing.sm) {
+                    playerRow(enabled[0])
+                    if enabled.count >= 2 {
+                        if enabled.count > 2 {
+                            morePlayersRow(count: enabled.count - 1)
+                        } else {
+                            playerRow(enabled[1])
+                        }
+                    }
+                }
+                .padding(.top, DesignSystem.Spacing.sm)
+            }
             Button(action: onOpenPlayerSettings) {
                 Text("打开播放器设置…")
                     .textLineBox(DesignSystem.Typography.body)
                     .foregroundStyle(DesignSystem.Colors.textPrimary)
-                    .frame(maxWidth: .infinity, minHeight: DesignSystem.Control.md)
+                    .frame(maxWidth: .infinity)
+                    .frame(height: DesignSystem.Control.md)
             }
             .buttonStyle(.plain)
             .background(
                 RoundedRectangle(cornerRadius: DesignSystem.Radius.small, style: .continuous)
                     .fill(DesignSystem.Colors.badgeFill)
             )
+            // E7 豁免：持久填充面再内缩 4，填充块落在 27…273。
+            .padding(.horizontal, DesignSystem.Spacing.xs)
+            .padding(.top, DesignSystem.Spacing.md)
             .accessibilityLabel("打开播放器兼容设置")
         }
         .frame(maxWidth: .infinity, alignment: .leading)
         .onChange(of: version) { _ in }
+    }
+
+    /// 列表行：图标 16 @ x23、间隙 8、名称 @ x47，行高 20。
+    private func playerRow(_ entry: PlayerEntry) -> some View {
+        HStack(spacing: DesignSystem.Spacing.sm) {
+            playerIcon(entry)
+            Text(entry.name)
+                .lineLimit(1)
+                .textStyle(DesignSystem.Typography.body)
+                .foregroundStyle(DesignSystem.Colors.textPrimary)
+            Spacer(minLength: DesignSystem.Spacing.none)
+        }
+        .frame(height: DesignSystem.Control.xs)
+    }
+
+    /// ≥3 个已开启：第 2 行折叠为「另有 N 个已开启」，不增高。
+    private func morePlayersRow(count: Int) -> some View {
+        HStack(spacing: DesignSystem.Spacing.sm) {
+            Image(systemName: "ellipsis")
+                .resizable()
+                .scaledToFit()
+                .frame(width: DesignSystem.Size.icon, height: DesignSystem.Size.icon)
+                .foregroundStyle(DesignSystem.Colors.textTertiary)
+            Text("另有 \(count) 个已开启")
+                .lineLimit(1)
+                .textStyle(DesignSystem.Typography.body)
+                .foregroundStyle(DesignSystem.Colors.textTertiary)
+            Spacer(minLength: DesignSystem.Spacing.none)
+        }
+        .frame(height: DesignSystem.Control.xs)
+    }
+
+    /// 播放器图标：装了就取真实 app 图标，没装退化为同尺寸符号（尺寸口径一致）。
+    @ViewBuilder
+    private func playerIcon(_ entry: PlayerEntry) -> some View {
+        if let symbol = PlayerIconFixture.symbolName {
+            Image(systemName: symbol)
+                .resizable()
+                .scaledToFit()
+                .frame(width: DesignSystem.Size.icon, height: DesignSystem.Size.icon)
+                .foregroundStyle(DesignSystem.Colors.textTertiary)
+        } else if let url = NSWorkspace.shared.urlForApplication(withBundleIdentifier: entry.bundleID) {
+            Image(nsImage: NSWorkspace.shared.icon(forFile: url.path))
+                .resizable()
+                .frame(width: DesignSystem.Size.icon, height: DesignSystem.Size.icon)
+        } else {
+            Image(systemName: "app.fill")
+                .resizable()
+                .scaledToFit()
+                .frame(width: DesignSystem.Size.icon, height: DesignSystem.Size.icon)
+                .foregroundStyle(DesignSystem.Colors.textTertiary)
+        }
     }
 }

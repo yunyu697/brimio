@@ -61,6 +61,11 @@ enum DesignSystem {
     enum Size {
         /// 1pt 发丝线：阴影遮罩、空状态虚线描边。
         static let hairline: CGFloat = 1
+        /// 0.5pt：形状外侧的同色 overscan。
+        /// 形状边缘落在半像素时，最外那一列像素只有部分覆盖，浅色背景会从这一格透出来，
+        /// 观感上就是一圈白线。垫一层同色、外扩 0.5pt 的底，让主形状的抗锯齿像素压在同色上。
+        /// 取值依据：2x 屏上 1 设备像素 = 0.5pt。
+        static let overscan: CGFloat = 0.5
         /// 16pt：Tab 图标、播放控制图标的绘制尺寸（命中区用 Control 档位）。
         static let icon: CGFloat = 16
         /// 20pt：文件架每行的文件图标边长。语义独立于「闭合态徽标」，
@@ -136,6 +141,8 @@ enum DesignSystem {
         static let divider = Color.white.opacity(0.12)
         /// 色块底：Tab 选中块、封面占位底。
         static let badgeFill = Color.white.opacity(0.1)
+        /// 整行可点内容的 hover 底（SPEC §4 / E7 豁免对象：hover 面不随填充面内缩）。
+        static let hoverFill = Color.white.opacity(0.06)
     }
 
     // MARK: - 效果
