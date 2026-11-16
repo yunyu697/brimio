@@ -41,6 +41,18 @@ final class NotchViewModel: ObservableObject {
     /// 闭合态缩略图与展开态内容都靠它让位，不再从「闭合宽度 − 4」自己反推边界。
     var hardwareHalfWidth: CGFloat?
 
+    /// 闭合态是否允许把形状撑出硬件带、在刘海右侧挂一枚徽标。
+    ///
+    /// **决策 D1（2026-11-16，项目所有者拍板）：不允许。**
+    /// 理由是几何事实，不是口味：硬件带（本机 179×32）之内是禁画区——那里没有像素，
+    /// 画进去等于把信息藏起来（§5-C 已作废「收进禁画矩形算合规」）；带外就是越界压菜单栏，
+    /// 用户已明确否决遮挡菜单栏图标。两条合起来，闭合态**没有**可显示指示的位置。
+    ///
+    /// 因此闭合态回归「纯形状」（SPEC §5-A 第 2 条的主形态）。
+    /// 要恢复徽标，必须先重新决定「允许越界多少」，并把
+    /// `NotchHardware.antialiasAllowance` 一起改——门禁会先红，不会静默放行。
+    static let closedBadgeAllowed = false
+
     /// 闭合态缩略图右侧内边距：位置由硬件右缘 + `contentGap` 反推，
     /// 而不是沿用形状自身的抗锯齿外扩来凑。
     var closedBadgeTrailing: CGFloat {
@@ -106,8 +118,11 @@ final class NotchViewModel: ObservableObject {
     }
 
     /// 闭合态缩略图位：有播放会话才占宽，没有则完全为 0（不占位）。
+    ///
+    /// 决策 D1 之后恒为 0：闭合形状宽度 = 硬件派生值，不再为徽标加宽。
     var closedBadgeExtraWidth: CGFloat {
-        showsClosedBadge ? DesignSystem.Size.closedBadge + DesignSystem.Spacing.sm : 0
+        guard Self.closedBadgeAllowed, showsClosedBadge else { return 0 }
+        return DesignSystem.Size.closedBadge + DesignSystem.Spacing.sm
     }
 
     /// 闭合态是否显示右侧徽标：有曲目（唯一能拿到元数据的通道），
@@ -120,7 +135,7 @@ final class NotchViewModel: ObservableObject {
     /// 为什么要过滤音乐类：IOPM 只知道「有进程在出声」，网页视频、微信语音、游戏
     /// 都会命中；不过滤就会在刘海右边弹出浏览器/微信图标。这类会话只进展开态。
     var showsClosedBadge: Bool {
-        guard !isOpen else { return false }
+        guard Self.closedBadgeAllowed, !isOpen else { return false }
         if media.hasTrack { return true }
         return media.isPresenceOnly && media.isMusicPlayer
     }

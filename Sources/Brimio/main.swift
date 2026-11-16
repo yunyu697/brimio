@@ -252,30 +252,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                     "hardware rect matches auxiliary gap",
                     "width=\(box.rect.width) derived=\(derived) estimated=\(box.isEstimated)"
                 )
-                // 徽标：位置取视图真正用的 `closedBadgeTrailing`，
-                // 按「形状右缘 − 内边距 − 徽标宽」换算到屏幕中心坐标系再比。
-                let badgeVM = NotchViewModel(
-                    closedSize: ScreenGeometry.closedSize(for: metrics),
-                    menuBarHeight: ScreenGeometry.menuBarHeight(for: metrics)
-                )
-                badgeVM.hardwareHalfWidth = NotchHardware.clearanceHalfWidth(for: metrics)
-                badgeVM.applyMedia(
-                    MediaSnapshot(
-                        title: "T", artist: "A", album: "B",
-                        isPlaying: true, artwork: nil, source: .music
-                    ),
-                    permission: .granted
-                )
-                let slot = badgeVM.notchSize.width
-                let badgeLeft = -slot / 2 + badgeVM.closedBadgeOffset + slot
-                    - badgeVM.closedBadgeTrailing - DesignSystem.Size.closedBadge
-                let hardwareRight = box.rect.maxX - metrics.frame.midX
+                // 闭合态宽度上限（决策 D1，2026-11-16 项目所有者拍板）：
+                // 形状不得超出硬件带，唯一豁免是 2pt/边的抗锯齿补偿（总宽 +4）。
+                // 旧口径把「向右加宽 28pt 放播放徽标」当正确行为，等于把越界写成规范：
+                // 179 之内是硬件禁画区（无像素），之外就是压菜单栏图标。
+                let closed = ScreenGeometry.closedSize(for: metrics)
+                let overhang = closed.width - box.rect.width
                 check(
-                    badgeLeft - hardwareRight >= NotchHardware.contentGap - 0.01,
-                    "closed badge clears hardware by \(NotchHardware.contentGap)pt",
+                    overhang <= NotchHardware.antialiasAllowance + 0.01,
+                    "closed shape stays inside the hardware band",
                     String(
-                        format: "badgeLeft=%+.1f hardwareRight=%+.1f gap=%+.1f estimated=%@",
-                        badgeLeft, hardwareRight, badgeLeft - hardwareRight,
+                        format: "closed=%.1f hardware=%.1f overhang=%+.1f allowance=%.1f estimated=%@",
+                        closed.width, box.rect.width, overhang,
+                        NotchHardware.antialiasAllowance,
                         box.isEstimated ? "true" : "false"
                     )
                 )
@@ -678,6 +667,50 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                         + " = \(Int($0.shapeSize.width))x\(Int($0.shapeSize.height))"
                 }.joined(separator: "；")
             )
+            // 决策 D2（2026-11-16 项目所有者拍板）：u = 4 栅格 + 宽度阶梯。
+            // 属**我方决定**，上游四家都没有这两条（见 SPEC §2.1 的取证注）。
+            let u = DesignSystem.Grid.unit
+            let onGridValues: [(String, CGFloat)] = [
+                ("Spacing.xs", DesignSystem.Spacing.xs),
+                ("Spacing.sm", DesignSystem.Spacing.sm),
+                ("Spacing.md", DesignSystem.Spacing.md),
+                ("Spacing.lg", DesignSystem.Spacing.lg),
+                ("contentPadding", PageMetrics.contentPadding),
+                ("chromeHeight", PageMetrics.chromeHeight),
+                ("rowSpacing", PageMetrics.rowSpacing),
+                ("topInset", PageMetrics.topInset)
+            ]
+            let offGrid = onGridValues.filter {
+                abs($0.1.truncatingRemainder(dividingBy: u)) > 0.001
+            }
+            check(
+                offGrid.isEmpty,
+                "every layout constant sits on the \(Int(u))pt grid",
+                offGrid.isEmpty
+                    ? onGridValues.map { "\($0.0)=\(Int($0.1))" }.joined(separator: " ")
+                    : "off-grid: " + offGrid.map { "\($0.0)=\($0.1)" }.joined(separator: " ")
+            )
+            let ladderOffGrid = PageMetrics.widthLadder.filter {
+                abs($0.truncatingRemainder(dividingBy: u)) > 0.001
+            }
+            let widthsFromLadder = ExpandedItem.allCases.allSatisfy {
+                PageMetrics.widthLadder.contains($0.shapeSize.width)
+            }
+            check(
+                ladderOffGrid.isEmpty && widthsFromLadder,
+                "expanded widths come from the declared ladder",
+                "ladder=[" + PageMetrics.widthLadder.map { String(Int($0)) }.joined(separator: ",")
+                    + "] pages=" + ExpandedItem.allCases.map {
+                        "\($0.title)\(Int($0.shapeSize.width))"
+                            + (PageMetrics.widthLadder.contains($0.shapeSize.width) ? "✓" : "✗")
+                    }.joined(separator: " ")
+            )
+            // 底部余量上限 32（= 16 底距 + 至多一档），同属 D2。
+            check(
+                PageMetrics.contentPadding <= 32,
+                "bottom margin stays within 16 + one step",
+                "bottom=\(Int(PageMetrics.contentPadding))pt cap=32pt"
+            )
             check(
                 PageMetrics.chromeHeight <= DesignSystem.Control.md,
                 "chrome is at most one 28pt row",
@@ -699,7 +732,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                         + "=\(Int(b.total))"
                 }.joined(separator: "；")
             )
-            // 闭合态缩略图只向右长：无曲目不占宽，有曲目加宽 28pt 且位移半个增量。
+            // 闭合态播放：形状宽度必须与静息态**完全相同**（决策 D1）。
+            // 没有任何「最小指示」能塞进 179：带内是硬件禁画区（用户看不见），带外即越界。
             let badgeVM = NotchViewModel(closedSize: vm.closedSize, menuBarHeight: vm.menuBarHeight)
             let closedWidth = badgeVM.notchSize.width
             let hiddenOffset = badgeVM.closedBadgeOffset
@@ -713,14 +747,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             let badgeExtra = badgeVM.notchSize.width - closedWidth
             check(
                 badgeVM.media.hasTrack
-                    && badgeExtra == DesignSystem.Size.closedBadge + DesignSystem.Spacing.sm
+                    && badgeExtra == 0
                     && hiddenOffset == 0
-                    && badgeVM.closedBadgeOffset == badgeExtra / 2,
-                "closed media badge widens to the right only",
-                "closed=\(Int(closedWidth)) badge=\(Int(closedWidth + badgeExtra))"
-                    + " offset=\(badgeVM.closedBadgeOffset) hiddenOffset=\(hiddenOffset)"
+                    && badgeVM.closedBadgeOffset == 0
+                    && badgeVM.showsClosedBadge == false,
+                "closed playing state keeps the hardware width (D1)",
+                "closed=\(Int(closedWidth)) playing=\(Int(badgeVM.notchSize.width))"
+                    + " extra=\(badgeExtra) badge=\(badgeVM.showsClosedBadge)"
             )
-            // IOPM 通道只有状态没有曲目：同样走右侧加宽槽位（放应用图标），闭合态不放文字。
+            // IOPM 通道只有状态没有曲目：同样不得加宽（D1），闭合态不放文字也不放图标。
             let presenceVM = NotchViewModel(closedSize: vm.closedSize, menuBarHeight: vm.menuBarHeight)
             let presenceWidth = presenceVM.notchSize.width
             presenceVM.applyMedia(
@@ -729,10 +764,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             )
             let presenceExtra = presenceVM.notchSize.width - presenceWidth
             check(
-                presenceVM.showsClosedBadge
-                    && presenceExtra == DesignSystem.Size.closedBadge + DesignSystem.Spacing.sm
-                    && presenceVM.closedBadgeOffset == presenceExtra / 2,
-                "presence-only uses the right badge slot (never centered text)",
+                presenceExtra == 0
+                    && presenceVM.closedBadgeOffset == 0
+                    && presenceVM.showsClosedBadge == false,
+                "presence-only keeps the closed shape at hardware width",
                 "width=\(Int(presenceVM.notchSize.width)) extra=\(presenceExtra)"
                     + " offset=\(presenceVM.closedBadgeOffset)"
             )
@@ -2445,12 +2480,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         )
         let presenceExtra = presenceVM.notchSize.width - closedWidth
         check(
-            presenceVM.showsClosedBadge
-                && presenceExtra == DesignSystem.Size.closedBadge + DesignSystem.Spacing.sm
-                && presenceVM.closedBadgeOffset == presenceExtra / 2,
-            "presence-only fills the right badge slot with the app icon",
-            "width=\(Int(presenceVM.notchSize.width))"
-                + " offset=\(presenceVM.closedBadgeOffset) icon=\(AppIconCache.icon(forBundleID: presenceVM.media.bundleID) != nil)"
+            presenceExtra == 0
+                && presenceVM.showsClosedBadge == false
+                && presenceVM.closedBadgeOffset == 0,
+            "presence-only does not widen the closed shape (D1)",
+            "width=\(Int(presenceVM.notchSize.width)) extra=\(presenceExtra)"
+                + " icon=\(AppIconCache.icon(forBundleID: presenceVM.media.bundleID) != nil)"
         )
         // 音乐类过滤：IOPM 会命中网页视频 / 语音 / 游戏，这些不该点亮闭合态。
         let musicCases: [(bundleID: String, expected: Bool)] = [
@@ -2521,10 +2556,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             permission: .granted
         )
         check(
-            trackVM.media.hasTrack && trackVM.showsClosedBadge
-                && trackVM.notchSize.width == closedWidth + DesignSystem.Size.closedBadge + DesignSystem.Spacing.sm,
-            "track from AppleScript keeps the badge path",
-            "title=\(trackVM.media.title) width=\(Int(trackVM.notchSize.width))"
+            trackVM.media.hasTrack
+                && trackVM.notchSize.width == closedWidth,
+            "track from AppleScript keeps the closed width (D1)",
+            "title=\(trackVM.media.title) width=\(Int(trackVM.notchSize.width)) badge=\(trackVM.showsClosedBadge)"
         )
         let emptyVM = makeVM()
         emptyVM.applyMedia(.none, permission: .granted)

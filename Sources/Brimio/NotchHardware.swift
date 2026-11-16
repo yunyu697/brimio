@@ -17,6 +17,13 @@ enum NotchHardware {
         sysctlbyname("hw.model", &buffer, &size, nil, 0)
         return String(cString: buffer)
     }
+    /// 形状允许超出硬件带的**总宽**上限：2pt/边的抗锯齿补偿。
+    ///
+    /// 这 4pt 只用于让最外一列像素压在同色上（见 `DesignSystem.Size.overscan` 的说明），
+    /// **不承载任何内容**。超过它就是真的把像素画到菜单栏上。
+    /// 决策 D1（2026-11-16，项目所有者拍板）：闭合态宽度上限 = 硬件带 + 本补偿。
+    static let antialiasAllowance: CGFloat = 4
+
     /// 形状本体为抗锯齿向硬件内伸出的量；这是设计内行为，断言只豁免这一圈。
     static func antialiasOverhang(closedWidth: CGFloat, hardwareWidth: CGFloat) -> CGFloat {
         max(0, (closedWidth - hardwareWidth) / 2)

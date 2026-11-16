@@ -42,6 +42,16 @@ enum DesignSystem {
 
     // MARK: - 间距（4 的倍数）
 
+    /// 布局栅格单位 u = 4。**决策 D2（2026-11-16，项目所有者拍板）**：
+    /// 宽度、间距、骨架常量一律取 u 的整数倍。
+    ///
+    /// 这是**我方决定**，不是行业做法：取证结论是上游四家（Boring Notch /
+    /// DynamicNotchKit / NotchDrop / Peninsula）都没有 spacing scale 或宽度阶梯。
+    /// 采纳的前提是接受「不许自由调宽」这一条产品约束。
+    enum Grid {
+        static let unit: CGFloat = 4
+    }
+
     /// 间距阶梯。只保留当前有使用点的档位：需要新档位时先改规范再加。
     enum Spacing {
         /// 0pt：结构对齐用（例如顶对齐的 VStack 不允许子视图被默认间距推开）。
