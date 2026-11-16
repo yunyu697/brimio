@@ -180,7 +180,9 @@ swift build --scratch-path /tmp/notch-build \
 
 ### 静态检查
 
-`--selftest` 里有三条：`lint discovers every swift file recursively`（守发现面）、`lint checks discovered files minus explicit exemptions`（守实际检查面）与 `view layer uses only DesignSystem tokens`（守 9 条规则）。
+`--selftest` 里有四条：`lint discovers every swift file recursively`（守发现面）、`lint checks discovered files minus explicit exemptions`（守实际检查面）、`view layer uses only DesignSystem tokens`（守 12 条规则）与 `minimumScaleFactor is gone from every source file`（零容忍全仓扫描，豁免文件也扫）。
+
+本轮新增的三条规则：`minimumScaleFactor` 一律失败（不允许偷偷缩字号）、页面内裸水平内边距（`padding(.horizontal, <数字>)`，内容盒只能由骨架注入一次）、页面内裸水平偏移（`offset(x: <数字>)`）。后两条只对页面文件生效，骨架层与 E7 豁免项写成带理由的显式白名单（`horizontalInsetWhitelist`），白名单本身也是代码、改动会进 diff，且命中后若不成立会报「白名单过期」。
 
 **扫描范围 = `Sources/Brimio` 下递归全部 `.swift` 文件 − 显式豁免清单。** 两个历史漏洞都堵掉了：先是按 `hasSuffix("View.swift")` 挑文件，导致 `PlayerSettingsWindow.swift`、`ClosedMediaBadge.swift` 一行都没被扫过；后来是只列顶层目录，`Generated/Naming.swift` 靠「放在子目录」整份躲过检查——等于用位置代替豁免。现在子目录一样进扫描集，**豁免只能以相对路径写进清单**：
 
@@ -190,24 +192,24 @@ swift build --scratch-path /tmp/notch-build \
 | `main.swift` | CLI / 离屏渲染脚手架：画布尺寸与红色标记线不属于界面规范 |
 | `Generated/Naming.swift` | 机器生成：由 `Scripts/naming.sh --emit-swift` 产出，不手写样式；要改请改 `Config/naming.env` |
 
-`--selftest` 分别断言**发现数**（含豁免，`expectedDiscoveredFileCount = 17`）与**实际检查数**（17 − 3 = 14，`expectedCheckedFileCount = 14`），并把文件名与每条豁免理由打印出来。只断言其中一个都可能出现「数量对得上、扫的却是另一批文件」的假绿，所以两个都断言：
+`--selftest` 分别断言**发现数**（含豁免，`expectedDiscoveredFileCount = 18`）与**实际检查数**（18 − 3 = 15，`expectedCheckedFileCount = 15`），并把文件名与每条豁免理由打印出来。只断言其中一个都可能出现「数量对得上、扫的却是另一批文件」的假绿，所以两个都断言（文件数会随源码增删变化，改文件时同步改这两个常量）：
 
 ```text
-[LINT] discovered 17 file(s): AudioPresence.swift, …, Generated/Naming.swift, …, main.swift
-[LINT] checked 14 file(s): AudioPresence.swift, ClosedMediaBadge.swift, …, ScreenGeometry.swift
+[LINT] discovered 18 file(s): AudioPresence.swift, …, Generated/Naming.swift, …, main.swift
+[LINT] checked 15 file(s): AudioPresence.swift, ClosedMediaBadge.swift, …, ScreenGeometry.swift
 [LINT] exempt DesignSystem.swift：规范本体：这里的字面量就是 token 定义本身
 [LINT] exempt main.swift：CLI / 离屏渲染脚手架：画布尺寸与红色标记线不属于界面规范
 [LINT] exempt Generated/Naming.swift：机器生成：由 Scripts/naming.sh --emit-swift 产出，不手写样式；要改请改 Config/naming.env
-[SELFTEST] PASS  lint discovers every swift file recursively (subdirectories included)  (17/17 discovered)
-[SELFTEST] PASS  lint checks discovered files minus explicit exemptions  (14/14 checked, 3 exempt)
-[SELFTEST] PASS  recursion proven by a negative case in a temp subdirectory  (discovered=1 violations=1 first=Views/FakeView.swift:1 裸内边距（应改用 DesignSystem.Spacing） -> …padding(8)…)
+[SELFTEST] PASS  lint discovers every swift file recursively (subdirectories included)  (18/18 discovered)
+[SELFTEST] PASS  lint checks discovered files minus explicit exemptions  (15/15 checked, 3 exempt)
+[SELFTEST] PASS  recursion and the three new rules proven by a negative case in a temp subdirectory  (discovered=1 violations=4 scale=true inset=true font=true first=Views/FakeView.swift:4: 缩字号（…） -> .minimumScaleFactor(0.9))
 ```
 
-最后一条是**负向用例**，用来证明递归真的生效而不是靠自报：在临时目录里造一棵 `Views/FakeView.swift`（含裸 `.padding(8)`）交给同一个 `scanUI(root:exemptions:)`，要求它被发现且报违规。若扫描退回「只列顶层目录」，这个文件根本不会被发现，断言立刻 FAIL。
+最后一条是**负向用例**，用来证明递归和三条新规则真的生效而不是靠自报：在临时目录里造一棵 `Views/FakeView.swift`（4 行缩字号、5 行裸水平内边距、6 行裸字号）交给同一个 `scanUI(root:exemptions:)`，要求它被发现且三处都报违规。若扫描退回「只列顶层目录」，或规则被写成只匹配某种缩进/写法，断言立刻 FAIL。
 
 纳入扫描后 `PlayerSettingsWindow.swift` 只暴露一处裸值：设置窗口 `fittingSize` 为空时的回退高度 `NSSize(width:height: 720)`，已改成 token `DesignSystem.Size.settingsFallbackHeight`。字号 / 内边距 / 圆角 / 颜色本来就走 token（`.textLineBox`、`Spacing.lg`、`Radius.small`、`Colors.*`），无需改动。
 
-命中 9 条规则就 FAIL 并打印文件:行号：
+命中 12 条规则就 FAIL 并打印 `文件:行号: 规则 -> 内容`：
 
 ```text
 [SELFTEST] FAIL  view layer uses only DesignSystem tokens  (1 violation(s))
@@ -237,7 +239,7 @@ swift build --scratch-path /tmp/notch-build \
 
 `swift build`：编译成功。
 
-`Brimio --selftest`：72 项全部 PASS，退出码 0（无屏注入模式 68 项，差异见「无屏（CI）模式」一节。M1 之前是 24 项；M1 新增 8 项路由/内边距断言；首页改版新增 chrome 高度、三桶高度预算、占比合计 100%、首页内容块最大 4 项；M2 新增闭合态缩略图加宽 1 项；坐标空间那一轮把 2 条宽松的 on-screen 断言换成 3 条严格断言；IOPM 降级那轮新增「只有状态时用右侧槽位放图标」「没有音频进程时闭合态不动」2 项；闭合态去文字那轮新增「闭合层没有任何文字节点」1 项；音乐类过滤那轮新增「非音乐音频进程不点亮闭合态」1 项；播放器兼容那轮新增 5 项：第三方默认关闭、开启后持久化、能再关回、系统播放器恒开且不可关、每项都写全权限/收益/后果；设计门禁那轮新增 2 项：`lint scans every UI source file`（14 个文件全覆盖）与 `every page keeps content above 30% of panel height`（逐页报份额、豁免带原因）；权限对齐那轮新增 2 项：`each player's stated permission equals what the code requests`、`automation players match the AppleScript targets exactly`；M3 文件架那轮新增 17 项：五状态尺寸/份额、212 上限、高度派生、置顶与去重、大小格式化、单条移除、move 即移除、外部删除后 prune、copy 保留、清空、拖放三条验收各 2 条细化、`app sources never call the accessibility API`；设计门禁改递归那轮把 1 项拆成 3 项：发现数、检查数、子目录负向用例）。关键输出：
+`Brimio --selftest`：全部 PASS，退出码 0（无屏注入模式少 4 项，差异见「无屏（CI）模式」一节）。**条数以末行 `[SELFTEST] PASS all N checks` 为准（当前默认模式 98、注入模式 94），每轮门禁增删都会变。** 历史增量：M1 之前 24 项；M1 新增 8 项路由/内边距断言；首页改版新增 chrome 高度、三桶高度预算、占比合计 100%、首页内容块最大 4 项；M2 新增闭合态缩略图加宽 1 项；坐标空间那一轮把 2 条宽松的 on-screen 断言换成 3 条严格断言；IOPM 降级那轮新增「只有状态时用右侧槽位放图标」「没有音频进程时闭合态不动」2 项；闭合态去文字那轮新增「闭合层没有任何文字节点」1 项；音乐类过滤那轮新增「非音乐音频进程不点亮闭合态」1 项；播放器兼容那轮新增 5 项：第三方默认关闭、开启后持久化、能再关回、系统播放器恒开且不可关、每项都写全权限/收益/后果；设计门禁那轮新增 2 项：`lint scans every UI source file`（14 个文件全覆盖）与 `every page keeps content above 30% of panel height`（逐页报份额、豁免带原因）；权限对齐那轮新增 2 项：`each player's stated permission equals what the code requests`、`automation players match the AppleScript targets exactly`；M3 文件架那轮新增 17 项：五状态尺寸/份额、212 上限、高度派生、置顶与去重、大小格式化、单条移除、move 即移除、外部删除后 prune、copy 保留、清空、拖放三条验收各 2 条细化、`app sources never call the accessibility API`；设计门禁改递归那轮把 1 项拆成 3 项：发现数、检查数、子目录负向用例；本轮布局与缩字号门禁 +6（高度表逐档对表、`H = 92 + C`、填充面 27/246、文案单行档、`minimumScaleFactor` 清零、递归负向用例扩到三条规则）。关键输出：
 
 ```text
 [Brimio] window frame={{577, 724}, {316, 232}} contentLayout={{0, 0}, {316, 232}} content={{0, 0}, {316, 232}} safeAreaTop=0.0 closed={183, 32} menuBar=33.0 chin=1.0 screen=内建视网膜显示器
@@ -315,14 +317,15 @@ swift build --scratch-path /tmp/notch-build \
 [LINT] checked 15 file(s): AudioPresence.swift, ClosedMediaBadge.swift, ExpandedContentView.swift, ExpandedItem.swift, FileShelfView.swift, MediaService.swift, NotchHardware.swift, NotchPanel.swift, NotchRootView.swift, NotchShape.swift, NotchViewModel.swift, NotchWindowController.swift, PlayerRegistry.swift, PlayerSettingsWindow.swift, ScreenGeometry.swift
 [SELFTEST] PASS  lint discovers every swift file recursively (subdirectories included)  (18/18 discovered)
 [SELFTEST] PASS  lint checks discovered files minus explicit exemptions  (15/15 checked, 3 exempt)
-[SELFTEST] PASS  recursion proven by a negative case in a temp subdirectory  (discovered=1 violations=1 first=Views/FakeView.swift:1 …)
+[SELFTEST] PASS  recursion and the three new rules proven by a negative case in a temp subdirectory  (discovered=1 violations=4 scale=true inset=true font=true first=Views/FakeView.swift:4 …)
 [SELFTEST] PASS  view layer uses only DesignSystem tokens  (15 file(s) clean)
+[SELFTEST] PASS  minimumScaleFactor is gone from every source file (exemptions included)  (0 hit(s))
 [SELFTEST] PASS  closed layer contains no text nodes  (NotchRootView.swift: 0 text)
 [SELFTEST] PASS  app sources never call the accessibility API  (0 hit(s) outside main.swift)
-[SELFTEST] PASS all 86 checks  source=NSScreen
+[SELFTEST] PASS all 98 checks  source=NSScreen
 ```
 
-这 86 项覆盖的都是「可断言的事实」：
+这 98 项覆盖的都是「可断言的事实」（下表项数是编写时的快照，**以末行 `PASS all N checks` 为准**）：
 
 | 类别 | 项数 | 具体项 |
 |---|---|---|
@@ -342,14 +345,26 @@ swift build --scratch-path /tmp/notch-build \
 | 界面规范 | 7 | **递归**发现 18 个 `.swift`、实际检查 15 个（生成文件以路径进显式豁免清单并写明原因）、子目录负向用例证明递归生效、这 15 个文件里没有裸的字号/行高/间距/尺寸/圆角/颜色、闭合层（`NotchRootView.swift`）里没有任何 `Text(`/`Label(`、**除 `main.swift` 探针外没有任何 `AXUIElement` / `AXIsProcessTrusted` 调用** |
 | 播放器兼容 | 7 | 第三方默认关闭、开启后持久化、能再关回、系统播放器恒开且不可关、每项写全权限/收益/后果、**权限声明逐条等于代码实际请求**、**声明 Automation 的 App 与 AppleScript 覆盖集合完全相等** |
 
+### 基线抓图（`--render-baseline`）
+
+`Brimio --render-baseline=<目录>` 在真实窗口上逐态合成 **16 态**（闭合 3 + 展开 13），写 PNG + `index.json` + `metrics.json`，并对每态断言几何与文案：
+
+- **态矩阵**：闭合 3（idle / playing / presence）、首页 4（播放中 148 / 仅状态 120 / 拒绝 120 / 空 107）、文件架 5（0–4 条，124/124/164/204/232）、设置页 3（166/194/222）、计时器 1（107）。比早先的 15 态多一个 `open-home-presence`——它是独立版式（C = 28），不覆盖等于首页四种版式只测三种。
+- **形状与高度**：`shape-height` 把每态实测形状高对 SPEC 高度表（容差 0.5pt），`height-formula` 独立校验 `H = 92 + C`（`fixedOverhead = 92` 另有断言）。
+- **像素级版式**：`fill-face-edges`（设置页按钮填充面相对形状左缘 27…273、宽 246，容差 1pt）、`files-e7-stability`（0↔1 条切换时虚线框与首行布局左缘差 0）、`files-top-anchor`（虚线框上缘 76、首行图标上缘 82）、`content-clearance`（内容盒左缘 = 侧壁 + 4）。
+- **文案**：`text-fit` 用真实字符串按页面真实可用宽度排版，校验「声明行数 == 实际行数」，同时抓「被省略号截断」与「声明双行却只有一行」两个方向。
+- **抓图前提**：必须在 `caffeinate -d -u` 保护的会话里跑，显示器休眠会抓出全透明帧并让整轮 FAIL。
+
+条数随门禁增删变化，以末行 `[BASELINE] N checks, M failed` 为准（当前 374 / 0），不要在本文件里维护具体条数。
+
 ### 无屏（CI）模式
 
 `--selftest --headless-geometry=1512x982,inset=32,menubar=32` 把屏幕几何参数化注入，runner 没有物理屏也能真跑同一套断言。生产路径仍然从 `NSScreen` 取，只有显式给出这个参数（或环境变量 `BRIMIO_HEADLESS_GEOMETRY`）时才走注入分支。本机两种模式实测：
 
 | 模式 | 几何来源断言输出 | PASS |
 |---|---|---|
-| 默认（NSScreen） | `source=NSScreen name=Built-in Retina Display frame=1470x956 inset=32` | 86 |
-| 注入（headless） | `source=injected name=injected 1512x982 frame=1512x982 inset=32` | 82 |
+| 默认（NSScreen） | `source=NSScreen name=Built-in Retina Display frame=1470x956 inset=32` | 98 |
+| 注入（headless） | `source=injected name=injected 1512x982 frame=1512x982 inset=32` | 94 |
 
 差的 4 条全部来自「WindowServer 注册 / CG 坐标空间对齐」一段：窗口是否真的出现在屏幕上、与同 frame 对照窗口的合成结果是否完全一致、CG bounds 是否等于 frame 映射值、是否贴住屏幕顶。这一段要做坐标空间换算，必须有真实屏幕，因此注入模式下不执行，并在日志里显式列出 5 项「本环境不覆盖」（真实 `NSScreen` 读数、窗口层级与跨屏跟随、真实指针位置相关的 hover/拖放采样、屏幕录制与视觉复核、菜单栏自动隐藏状态下的 auxiliary 信号），不是静默跳过。
 
@@ -911,7 +926,7 @@ shasum -a 256 /abs/build/Brimio.app/Contents/MacOS/Brimio /abs/scratch/out/Produ
 | 项 | 结果 |
 |---|---|
 | `--media-probe`（Music 未运行） | `[MEDIA] no track: 播放器未运行或已停止（source=music）`，exit 0 |
-| `--selftest` | 72 项 PASS（无屏注入 68 项），含 `geometry source is NSScreen`、`closed media badge widens to the right only (closed=183 badge=211 offset=14.0)`、`presence-only uses the right badge slot (never centered text)`、`non-music audio process keeps the closed notch quiet`、`closed layer contains no text nodes`、`third-party player is off by default`、`system players stay enabled and cannot be switched off`、`each player's stated permission equals what the code requests`、`automation players match the AppleScript targets exactly`、文件架五状态尺寸与份额（`file shelf holds its size and content share in all five states`）、`file shelf height is derived from the entry count`、`moving an entry out removes it immediately`、`deleting outside the app removes the entry on the next user action`、`hovering during a file drag does not expand the notch`、`app sources never call the accessibility API`、`lint discovers every swift file recursively (17/17)`、`lint checks discovered files minus explicit exemptions (14/14, 3 exempt)`、`recursion proven by a negative case in a temp subdirectory`、`every page keeps content above 30% of panel height` |
+| `--selftest` | 全部 PASS（当前 98，无屏注入 94；以末行 `PASS all N checks` 为准），含 `geometry source is NSScreen`、`closed media badge widens to the right only (closed=183 badge=211 offset=14.0)`、`presence-only uses the right badge slot (never centered text)`、`non-music audio process keeps the closed notch quiet`、`closed layer contains no text nodes`、`third-party player is off by default`、`system players stay enabled and cannot be switched off`、`each player's stated permission equals what the code requests`、`automation players match the AppleScript targets exactly`、文件架五状态尺寸与份额（`file shelf holds its size and content share in all five states`）、`file shelf height is derived from the entry count`、`moving an entry out removes it immediately`、`deleting outside the app removes the entry on the next user action`、`hovering during a file drag does not expand the notch`、`app sources never call the accessibility API`、`lint discovers every swift file recursively (18/18)`、`lint checks discovered files minus explicit exemptions (15/15, 3 exempt)`、`recursion and the three new rules proven by a negative case in a temp subdirectory`、`minimumScaleFactor is gone from every source file (0 hit(s))`、`every page keeps content above 30% of panel height` |
 | `--presence-probe`（网易云在播，2026-11-15） | `live pid=90938 bundle=com.netease.163music app=网易云音乐 playing=true`；14 项 PASS（暂停 / 退出 / 音乐类过滤 / 白名单优先级 / 三行真实类别 / presence→UI / track→UI / CoreAudio 挂载与摘除），未发送任何播放控制指令 |
 | `--power-probe`（打包后的 `.app` 二进制，无窗口、同进程 A/B） | 校准 `+27`（0.4s 定时器 25 次）；三次运行 ON `+10/+11`、`+11/+8`、`+11/+11`，OFF 恒为 `+2/+2`，差 8.5 / 7.5 / 9.0（fires 均为 10），CPU 全 0.000s |
 | 播放器兼容开关（`--selftest` + `settings-players.png`） | 第三方默认关、开启持久化、能再关回、系统播放器恒开且不可关；每项都写权限 / 收益 / 后果；权限声明与 `MediaService.permissionsRequested(for:)` 逐条相等；第三方=「不需要额外权限」，系统播放器=Automation |
